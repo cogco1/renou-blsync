@@ -522,7 +522,7 @@ class Batch:
     def apply(self, ov):
         t0 = time.time()
         out = {"rev": ov.get("rev"), "written": ov.get("written")}
-        if ov.get("base_sha256") and ov["base_sha256"] != self.base_sha:
+        if ov.get("base_sha256") and self.base_sha and ov["base_sha256"] != self.base_sha:
             raise ValueError(f"override base {ov['base_sha256'][:12]} != loaded table {self.base_sha[:12]}")
         self.revert_meshes(set(ov.get("meshes") or {}), out)
         self.update_meshes(ov.get("meshes"), out)
@@ -763,6 +763,88 @@ def conflicts(b, ids, limit=50):
     return out
 
 
+class GroundBatch(Batch):
+    """#18: ground tiles (scene-imported actors <tile>_LOD0 in a ground layer such as /Game/Inst/ground_core, tagged
+    INST_<name> and CITY_INST_GROUND) are no HISM instances: a tile changes as a whole. The override's "meshes" maps
+    tile ids (the actor label without _LOD<n>, e.g. CITY_T_3_-2) to one-tile GLBs; the tile's StaticMeshComponent is
+    switched in place, every slot keeps UE's material by the usual rule (terrain slots keep MI_CT_Terrain). No
+    instances, so positions never change; a tile that leaves "meshes" gets its release mesh back.
+    REQUEST {"kind": "ground", "name": "ground_core", "batch": "ground_core" (override files' batch name)}"""
+
+    def __init__(self, req):
+        t0 = time.time()
+        self.name = req["name"]
+        self.data = {"batch": req.get("batch", self.name), "instances": []}
+        self.placements, self.base_sha = None, None
+        self.dest = f"{LIVE_ROOT}/{self.name}"
+        self.prefer = ["NEAR"]
+        self.slot_table_path, self.slot_table, self.slot_table_norm = load_slot_table(req.get("slot_table"))
+        self.unmapped = set()
+        self.tiles, self.hosts = {}, {}
+        for a in EAS.get_all_level_actors():
+            if f"INST_{self.name}" not in [str(t) for t in a.tags]:
+                continue
+            for c in a.get_components_by_class(unreal.StaticMeshComponent):
+                m = c.get_editor_property("static_mesh")
+                if m is not None:
+                    tid = re.sub(r"_LOD\d+$", "", a.get_actor_label())
+                    self.tiles[tid] = (a, c, m)
+                    self.hosts[tid] = a
+        assert self.tiles, f"no INST_{self.name} ground actors in the open level"
+        self.comps, self.base, self.home, self.slot, self.free, self.applied = {}, {}, {}, {}, {}, {}
+        self.rev, self.mesh_sha, self.keypath, self.mesh_orig, self.orig_count = None, {}, {}, {}, {}
+        self.meshes = {}
+        self.level_files = sorted({level_file(a) for a, _c, _m in self.tiles.values()} - {None})
+        self.report = {"batch": self.data["batch"], "kind": "ground", "tiles": len(self.tiles),
+                       "level_files": self.level_files, "seconds": round(time.time() - t0, 2)}
+
+    def update_meshes(self, meshes, out):
+        for tid, info in (meshes or {}).items():
+            if tid not in self.tiles:
+                out.setdefault("errors", []).append(f"tile {tid}: no such ground actor in {self.name}")
+                continue
+            glb = Path(info["glb"])
+            want = info.get("sha256")
+            if want and self.mesh_sha.get(tid) == want:
+                continue
+            got = sha_file(glb)
+            if want and got != want:
+                out.setdefault("errors", []).append(f"tile {tid}: sha {got[:12]} != {want[:12]} (file still being written?)")
+                continue
+            t = time.time()
+            a, comp, orig = self.tiles[tid]
+            cur = comp.get_editor_property("static_mesh")
+            folder = f"{LIVE_ROOT}/{self.name}/{tid}_{got[:8]}"
+            gm = glb_materials(glb)
+            textured = {_norm(n) for n, tex in gm.items() if tex}
+            self.textured_now = textured
+            need = self.needs_glb_materials(list(gm), cur)
+            found = []
+            if EAL.does_directory_exist(folder):
+                found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
+            if not any(isinstance(x, unreal.StaticMesh) for x in found):
+                interchange_mesh(glb, folder, materials=need)
+                found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
+            sms = [x for x in found if isinstance(x, unreal.StaticMesh)]
+            if len(sms) != 1:
+                out.setdefault("errors", []).append(f"tile {tid}: {len(sms)} static meshes in {glb.name}, need exactly 1 (LOD0 only)")
+                continue
+            if not hasattr(self, "textured_by_mesh"):
+                self.textured_by_mesh = {}
+            self.textured_by_mesh[sms[0].get_path_name()] = textured
+            slots = self.carry_materials(comp, cur, sms[0])
+            self.mesh_sha[tid] = got
+            out.setdefault("meshes", []).append({"tile": tid, "glb_materials": need, "slots": slots,
+                                                  "triangles": sms[0].get_num_triangles(0), "seconds": round(time.time() - t, 2)})
+
+    def revert_meshes(self, keep, out):
+        for tid in [k for k in self.mesh_sha if k not in keep]:
+            a, comp, orig = self.tiles[tid]
+            self.carry_materials(comp, comp.get_editor_property("static_mesh"), orig)
+            del self.mesh_sha[tid]
+            out.setdefault("meshes_reverted", []).append(tid)
+
+
 def suspend():
     """before UE saves: every preview goes back to its table for a moment (files writable). Nothing is lost - override
     files are cumulative and resume() simply reads them again."""
@@ -780,7 +862,8 @@ def resume():
 
 
 def attach(req):
-    b = VegBatch(req) if req.get("kind") == "veg" else Batch(req)
+    kinds = {"veg": VegBatch, "ground": GroundBatch}
+    b = kinds.get(req.get("kind"), Batch)(req)
     S["batches"][b.name] = b
     log(f"attached {b.name}: {b.report}")
     return b.report
