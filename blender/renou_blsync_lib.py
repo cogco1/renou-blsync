@@ -85,6 +85,28 @@ def alive(o):
         return False
 
 
+def _slot_names_only(glb, names, part):
+    """Replace temporary material names in a locally exported GLB, keeping only slot names.
+    The export uses fresh, untextured placeholder materials, never the source shaders."""
+    import struct
+    raw = glb.read_bytes()
+    magic, version, length, size, kind = struct.unpack("<4sIIII", raw[:20])
+    if magic != b"glTF" or version != 2 or length != len(raw) or kind != 0x4e4f534a:
+        raise ValueError("unexpected GLB header")
+    doc = json.loads(raw[20:20 + size])
+    if doc.get("images") or doc.get("textures"):
+        raise ValueError("slot-only export unexpectedly contains textures")
+    if "materials" in doc:
+        doc["materials"] = [{"name": names[m["name"]]} for m in doc["materials"]]
+    if len(doc.get("meshes", [])) != 1:
+        raise ValueError("slot-only export must contain exactly one mesh")
+    doc["meshes"][0]["name"] = part
+    chunk = json.dumps(doc, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    chunk += b" " * (-len(chunk) % 4)
+    tail = raw[20 + size:]
+    glb.write_bytes(struct.pack("<4sIIII", magic, version, 20 + len(chunk) + len(tail), len(chunk), kind) + chunk + tail)
+
+
 class Batch:
     def __init__(self, placements, out, parts_glb=None, status=STATUS_DEFAULT, only_src=None, remote=None, load_meshes=True,
                  track_edits=False):
@@ -97,6 +119,7 @@ class Batch:
         self.remote = remote
         self._pushed = set()                 # (part, sha256) already copied to the server (remote mode)
         self._sig = {}                       # part -> mesh signature at load / last export (track_edits)
+        self._slot_only_parts = set()        # new independent parts: geometry and slot names, never source shaders
         self.bounds = {}                     # part -> (min, max) from the GLB header when load_meshes=False
         self.placements, self.out, self.status = Path(placements), Path(out), Path(status)
         raw = self.placements.read_bytes()
@@ -215,24 +238,89 @@ class Batch:
         me = self.meshes[src_part].copy()
         me.name = name
         self.meshes[name] = me
+        if src_part in self._slot_only_parts:
+            self._slot_only_parts.add(name)
         return me
+
+    def add_object(self, obj, part, era="both", src=""):
+        """Register a mesh object as a new part + instance; return the new instance (main thread, object mode).
+        Copy local mesh data and world TRS separately, leaving the source object, its parent and shaders unchanged.
+        New part ids are P + 12 hexadecimal digits. Modifiers are not applied; shear cannot be represented by TRS."""
+        if not isinstance(part, str) or re.fullmatch(r"P[0-9a-fA-F]{12}", part) is None:
+            raise ValueError("part must be P followed by 12 hexadecimal digits")
+        known = set(self.meshes) | set(self.mesh_out) | {rec["part"] for rec in self.base.values()}
+        if part.lower() in {name.lower() for name in known}:
+            raise ValueError(f"part {part} already exists")
+        if not isinstance(obj, bpy.types.Object) or obj.type != "MESH":
+            raise TypeError("add_object needs a Blender mesh object")
+        if obj.mode != "OBJECT":
+            raise ValueError("leave edit mode before adding an object")
+        bpy.context.view_layer.update()
+        world = obj.matrix_world.copy()
+        loc, quat, scale = world.decompose()
+        trs = Matrix.LocRotScale(loc, quat, scale)
+        if max(abs(world[i][j] - trs[i][j]) for i in range(4) for j in range(4)) > 1e-5:
+            raise ValueError("world transform has shear; placements support translation, rotation and scale only")
+        me = obj.data.copy()
+        me.name = part
+        for i, slot in enumerate(obj.material_slots):
+            me.materials[i] = slot.material    # respect object-linked slots as well as mesh-linked slots
+        new = bpy.data.objects.new(part, me)
+        new.matrix_world = world
+        new["blsync_part"], new["blsync_era"], new["blsync_src"] = part, era, src
+        self.adopt(new)
+        self.col.objects.link(new)
+        self.meshes[part] = me
+        self._slot_only_parts.add(part)
+        try:
+            self.export_part(part)
+        except Exception:
+            self.meshes.pop(part, None)
+            self.mesh_out.pop(part, None)
+            self._sig.pop(part, None)
+            self._slot_only_parts.discard(part)
+            bpy.data.objects.remove(new, do_unlink=True)
+            bpy.data.meshes.remove(me)
+            raise
+        return new
 
     def export_part(self, part, out_dir=None):
         """export ONE part's current mesh as <out>/meshes/<part>_<sha8>.glb (identity transform, glTF Y-up like the release);
         the next publish() lists it under "meshes" and UE swaps the mesh in place, keeping UE's materials per slot name."""
         me = self.meshes[part]
-        tmpo = bpy.data.objects.new(part, me)
-        bpy.context.scene.collection.objects.link(tmpo)
-        for o in bpy.context.view_layer.objects:
-            o.select_set(False)
-        tmpo.select_set(True)
-        bpy.context.view_layer.objects.active = tmpo
         d = Path(out_dir) if out_dir else self.out.parent / "meshes"
         d.mkdir(parents=True, exist_ok=True)
         tmp = d / f"{part}.tmp.glb"
-        bpy.ops.export_scene.gltf(filepath=str(tmp), export_format="GLB", use_selection=True, export_apply=False,
-                                  export_yup=True, export_animations=False, export_cameras=False, export_lights=False)
-        bpy.data.objects.remove(tmpo)
+        export_mesh, placeholders, names = me, [], {}
+        if part in self._slot_only_parts:
+            export_mesh = me.copy()
+            for i, material in enumerate(me.materials):
+                placeholder = bpy.data.materials.new("BLSYNC_SLOT")
+                placeholders.append(placeholder)
+                names[placeholder.name] = material.name if material else ""
+                export_mesh.materials[i] = placeholder
+        selected, active = list(bpy.context.selected_objects), bpy.context.view_layer.objects.active
+        tmpo = bpy.data.objects.new(part, export_mesh)
+        bpy.context.scene.collection.objects.link(tmpo)
+        try:
+            for o in bpy.context.view_layer.objects:
+                o.select_set(False)
+            tmpo.select_set(True)
+            bpy.context.view_layer.objects.active = tmpo
+            bpy.ops.export_scene.gltf(filepath=str(tmp), export_format="GLB", use_selection=True, export_apply=False,
+                                      export_yup=True, export_animations=False, export_cameras=False, export_lights=False)
+            if part in self._slot_only_parts:
+                _slot_names_only(tmp, names, part)
+        finally:
+            bpy.data.objects.remove(tmpo, do_unlink=True)
+            if export_mesh != me:
+                bpy.data.meshes.remove(export_mesh)
+            for material in placeholders:
+                bpy.data.materials.remove(material)
+            for o in selected:
+                if alive(o):
+                    o.select_set(True)
+            bpy.context.view_layer.objects.active = active if active is not None and alive(active) else None
         sha = hashlib.sha256(tmp.read_bytes()).hexdigest()
         glb = d / f"{part}_{sha[:8]}.glb"
         os.replace(tmp, glb)
@@ -456,7 +544,8 @@ class Batch:
             src_rec = next((x for x in self.data["instances"] if x.get("src") == e.get("src")), {})
             q = Quaternion(e["quat_wxyz"])
             r = {"id": iid, "part": e["part"], "lods": ["NEAR"], "pos": e["pos"], "quat_wxyz": e["quat_wxyz"],
-                 "yaw_deg": round(math.degrees(q.to_euler("XYZ").z), 3), "scale": e["scale"][0],
+                 "yaw_deg": round(math.degrees(q.to_euler("XYZ").z), 3),
+                 "scale": e["scale"][0] if max(e["scale"]) - min(e["scale"]) < 1e-6 else e["scale"],
                  "district": src_rec.get("district", self.batch), "zone": src_rec.get("zone", ""), "era": e.get("era", "both"),
                  "building_id": src_rec.get("building_id", ""), "src": e.get("src", "")}
             rows.append(r)

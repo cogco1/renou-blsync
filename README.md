@@ -46,7 +46,7 @@ blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.p
 blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock.py -- build
 ```
 
-两套最后一行都是 `RESULT OK` 就算通过，退出码 0。当前函数库 33 项、插件 19 项全部通过。GitHub Actions 每个 PR 也会自动跑。
+两套最后一行都是 `RESULT OK` 就算通过，退出码 0。当前函数库 53 项、插件 19 项全部通过。GitHub Actions 每个 PR 也会自动跑。
 
 函数库测试包括远程模式：`tests/fake_ssh.py` 把假 `ssh` / `scp` 放到 PATH 最前面，只在临时本地目录里模拟推送和回执，不连接服务器、不读取 ssh 配置。覆盖 GLB 去重、网格变化后重推、原子写入、回执读取和超时；测试结束恢复 PATH 并清理临时目录。
 
@@ -60,10 +60,24 @@ python3 tools/build_addon.py
 
 架构和以后的扩展方向见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+## 脚本登记新的独立物体
+
+在已经载入的批 `B` 中，登记一个 Blender 网格物体：
+
+```python
+instance = B.add_object(obj, "P0123456789ab", era="both", src="independent asset")
+receipt = B.publish("add independent asset")
+```
+
+件名必须是 `P` 加 12 位十六进制，不能与本批已有件重名（大小写也不能碰撞）。返回新实例对象，id 沿用 `<批>_bl…` 规则；复制网格，单独保留世界位置、旋转和三轴缩放，源物体、父级与材质不变。只导出网格和有效材质槽名，不带源材质参数或贴图；后续重导这个新件也保留这条规则。
+
+必须在主线程、物体模式下调用。使用物体的原始网格，不自动应用修改器。支持有父级的世界 TRS；无法用现有 TRS 格式表示的剪切会明确报错。`write_back()` 的新增实例保持 `NEAR`，非均匀缩放保留三轴列表，均匀缩放仍写标量。UE 新独立物体的对象层和材质映射仍需对应 UE issue 完成与实测。
+
 ## 现在在做什么
 
 - [x] 第 1 步：楼的摆放、换件、改单件形状（R1–R4、R7）
 - [x] LS01 框架初稿：Blender 插件（实时开关、变化监听、面板），底座是 R1 函数库，见 `docs/SPEC_v2_Blender侧.md`
+- [x] 第 2 步 Blender 侧：`add_object()` 登记独立物体，生成新件和实例，只导出材质槽名
 - [ ] 第 2 步：新的独立大件直接进 UE（永久 id、材质槽契约、未映射槽用醒目占位）
 - [ ] 第 3 步：地形、道路、地面按块同步；UE 只在受影响的格子里重跑 PCG
 
