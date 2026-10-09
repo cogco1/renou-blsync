@@ -9,6 +9,7 @@ REQUEST {"action": "attach", "placements": "/abs/<batch>_placements.json", "name
         {"action": "fingerprint"}   (R2: lights, sky, fog, post, foliage, cameras and untouched materials, as one hash)
         {"action": "reload"}   (re-import bl_sync_core after an update: drops the state, attach + watch again)
         {"action": "frame", "inst": "<instance id>", "cam": "BLSYNC", "dist": 1.6}   (CineCamera CAM_<cam> looking at it)
+        {"action": "frame", "cam": "BLSYNC", "remove": true}   (delete that temporary camera again)
 REPORT: what the core returned."""
 import importlib, math
 import unreal
@@ -38,6 +39,12 @@ elif act == "materials":
     REPORT = core.materials(REQ["name"], REQ["inst"])
 elif act == "where":
     REPORT = core.where(REQ["name"], REQ["inst"])
+elif act == "frame" and REQ.get("remove"):            # remove the temporary camera this script made (test views only)
+    EAS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    label = "CAM_" + REQ.get("cam", "BLSYNC")
+    gone = [a for a in EAS.get_all_level_actors() if isinstance(a, unreal.CineCameraActor) and a.get_actor_label() == label]
+    EAS.destroy_actors(gone)
+    REPORT = {"removed": len(gone)}
 elif act == "frame":
     b = next(iter(core.S["batches"].values()))
     key, idx = b.slot[REQ["inst"]]
