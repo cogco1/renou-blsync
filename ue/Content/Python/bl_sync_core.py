@@ -502,7 +502,7 @@ class Batch:
             b = self.base.get(iid)
             merged = dict({"part": b["part"], "era": b["era"], "pos": b["pos"], "quat_wxyz": b["quat"], "scale": b["scale"]} if b else {}, **d)
             new[iid] = norm_state(merged)
-        counts = {}
+        counts, touched = {}, []
         for iid in set(self.applied) | set(new):
             want = new.get(iid) or self.base.get(iid)   # dropped from the file: back to the table (or gone if it was new)
             have = self.applied.get(iid) or self.base.get(iid)
@@ -511,6 +511,8 @@ class Batch:
             try:
                 r = self.place(iid, want)
                 counts[r] = counts.get(r, 0) + 1
+                if r in ("moved", "added", "swapped"):
+                    touched.append(iid)
             except Exception as exc:
                 out.setdefault("errors", []).append(f"{iid}: {exc}")
         self.applied = {k: v for k, v in new.items()}
@@ -520,6 +522,10 @@ class Batch:
             if trimmed:
                 out["trimmed"] = trimmed
         out["save_guard"] = reguard()
+        if touched and not S.get("suspended"):
+            c = conflicts(self, touched)
+            if c:
+                out["conflicts"] = c
         if self.unmapped:
             out["unmapped_slots"] = sorted(self.unmapped)
         out.update(counts=counts, overrides=len(new), seconds=round(time.time() - t0, 3))
@@ -667,6 +673,65 @@ class VegBatch(Batch):
 
     def revert_meshes(self, keep, out):
         pass
+
+
+_NOT_HAND = ("CITY_INST", "CITY_VEG", "CITY_IMPORT", "CITY_ERA_")
+_NOT_HAND_CLS = ("Landscape", "WorldSettings", "Brush", "Light", "SkyLight", "DirectionalLight", "SkyAtmosphere",
+                 "ExponentialHeightFog", "PostProcessVolume", "VolumetricCloud", "CineCameraActor", "CameraActor",
+                 "WaterBody", "WaterZone", "InstancedFoliageActor", "LevelBounds", "NavigationData", "PlayerStart")
+
+
+def _hand_candidates():
+    """actors nobody syncs (props, decals, hand-placed meshes) with their world AABB, cached for 60 s."""
+    c = S.get("hand")
+    if c and time.monotonic() - c["t"] < 60:
+        return c["rows"]
+    hosts = {a.get_path_name() for b in S["batches"].values() for a in b.hosts.values()}
+    rows = []
+    for a in EAS.get_all_level_actors():
+        if a.get_path_name() in hosts:
+            continue
+        if any(str(t).startswith(_NOT_HAND) for t in a.tags):
+            continue
+        cls = a.get_class().get_name()
+        if cls.startswith(_NOT_HAND_CLS) or not (a.get_components_by_class(unreal.StaticMeshComponent)
+                                                 or a.get_components_by_class(unreal.DecalComponent)):
+            continue
+        o, e = a.get_actor_bounds(False)
+        if max(e.x, e.y, e.z) > 50000:             # > 1 km across: a landscape-like actor, not a hand-placed piece
+            continue
+        rows.append((a, (o.x - e.x, o.y - e.y, o.z - e.z), (o.x + e.x, o.y + e.y, o.z + e.z)))
+    S["hand"] = {"t": time.monotonic(), "rows": rows}
+    return rows
+
+
+def conflicts(b, ids, limit=50):
+    """#16: hand-placed actors whose bounds overlap an instance that was just moved / added / swapped (report only)."""
+    out = []
+    rows = _hand_candidates()
+    for iid in ids:
+        key_idx = b.slot.get(iid)
+        if not key_idx:
+            continue
+        comp = b.comps[key_idx[0]]
+        mesh = comp.get_editor_property("static_mesh")
+        if mesh is None:
+            continue
+        bb = mesh.get_bounding_box()
+        t = comp.get_instance_transform(key_idx[1], True)
+        pts = [t.transform_location(unreal.Vector(x, y, z)) for x in (bb.min.x, bb.max.x)
+               for y in (bb.min.y, bb.max.y) for z in (bb.min.z, bb.max.z)]
+        lo = (min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts))
+        hi = (max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts))
+        for a, alo, ahi in rows:
+            ov = [min(hi[i], ahi[i]) - max(lo[i], alo[i]) for i in range(3)]
+            if min(ov) > 0:
+                out.append({"inst": iid, "actor": a.get_actor_label(),
+                            "level": a.get_outer().get_outer().get_path_name().split(".")[0],
+                            "overlap_m": [round(v / 100, 1) for v in ov]})
+                if len(out) >= limit:
+                    return out
+    return out
 
 
 def suspend():
