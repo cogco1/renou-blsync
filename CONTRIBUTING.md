@@ -2,20 +2,23 @@
 
 ## 分工
 
-- **维护者**：「Blender→UE 实时预览」这个 Claude 会话。它负责 `blender/renou_blsync_lib.py` 和 `ue/`，审 PR，在服务器的 UE 测试工程上实测后再合并。
-- GPT/Codex 和其他 bot：写确定性的部分，比如 Blender 插件（LS01）、测试、工具，以及任务书里写清楚的功能。
+- **维护者：Ash**（2026-10-09 起，用户指定）。负责整个仓库的代码：写功能、审 PR、合并。框架初稿由协调（Claude）写好交接。
+- **UE 实测：**「Blender→UE 实时预览」这个 Claude 会话。CI 和 bot 都没有 UE，凡是动到 `ue/` 的 PR，或者改了覆盖文件、回执含义的 PR，合并前都要等它在服务器的 UE 测试工程上实测，在 PR 里留言“UE 实测通过”。
+- GPT/Codex 和其他 bot：按 issue 写确定性的部分（标了 `good-for-bot` 的），提 PR 给维护者。
 - 协调（Claude）：分任务、定优先级、和用户确认需求。需求以 `docs/需求_按D5分工.md` 为准。
 
 ## 怎么改
 
 1. 不直接推 `main`。从 `main` 开分支，名字写清楚，比如 `ls01-panel`、`fix-quat-sign`。
-2. 改完跑自测，必须 `RESULT OK`：
+2. 改完跑自测，两套都必须 `RESULT OK`（CI 也会跑）：
    ```bash
    blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.py -- build
+   blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock.py -- build
    ```
-   加了新功能，就在 `tests/test_lib_mock.py` 里加对应的检查。
-3. 提 PR，说明写：改了什么、为什么、自测结果。动到 UE 侧的，写明“需要 UE 实测”，由维护者在服务器上测。
-4. **只有一份函数库。** 不要另起一套。要改 `renou_blsync_lib.py` 的接口（函数名、参数、覆盖文件格式），先开 issue 说明理由，维护者同意后再改。
+   加了新功能，就在对应的测试里加检查。函数库的进 `test_lib_mock.py`，插件的进 `test_addon_mock.py`。
+3. 提 PR，说明写：改了什么、为什么、自测结果。动到 UE 侧的，写明“需要 UE 实测”，等实时预览会话测完再合并。
+4. **只有一份函数库。** 不要另起一套；插件只调库，不重复实现。要改 `renou_blsync_lib.py` 的已有接口（函数名、参数、覆盖文件格式），先开 issue 说明理由，维护者同意后再改；只加新函数不算改接口。
+5. 线程规矩：读写 Blender 数据（bpy）只在主线程；工作线程只做写文件、ssh 推送、等回执。
 
 ## 不能做的
 

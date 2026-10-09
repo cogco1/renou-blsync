@@ -62,13 +62,41 @@ def decompose(m):
     return loc, q, s
 
 
+def mesh_sig(me):
+    """SHA-256 of a mesh's vertex positions, polygon vertex indices and material slot names: tells a real geometry edit
+    from a mere 'geometry updated' depsgraph tag (entering edit mode, selection)."""
+    import numpy as np
+    co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+    me.vertices.foreach_get("co", co)
+    lv = np.empty(len(me.loops), dtype=np.int32)
+    me.loops.foreach_get("vertex_index", lv)
+    h = hashlib.sha256(co.tobytes())
+    h.update(lv.tobytes())
+    h.update("|".join(m.name if m else "" for m in me.materials).encode("utf-8"))
+    return h.hexdigest()
+
+
+def alive(o):
+    """False for a Python handle whose Blender object has been deleted."""
+    try:
+        o.name
+        return True
+    except ReferenceError:
+        return False
+
+
 class Batch:
-    def __init__(self, placements, out, parts_glb=None, status=STATUS_DEFAULT, only_src=None, remote=None, load_meshes=True):
+    def __init__(self, placements, out, parts_glb=None, status=STATUS_DEFAULT, only_src=None, remote=None, load_meshes=True,
+                 track_edits=False):
         """only_src: optional regex on src; instances not matching are not loaded (they stay as in the table).
         remote (R7, Blender on a laptop): "myserver:/workspace/jobs/look-blsync-20261009-01/data" - out / meshes are written
         locally, then pushed with the system's own scp/ssh (keys already set up; nothing stored here); the receipt is read
-        back over ssh. placements / parts_glb are local copies of the release files."""
+        back over ssh. placements / parts_glb are local copies of the release files.
+        track_edits (the add-on sets it): remember a signature of every part mesh, so export_part_if_changed() only exports
+        parts whose geometry really changed."""
         self.remote = remote
+        self._pushed = set()                 # (part, sha256) already copied to the server (remote mode)
+        self._sig = {}                       # part -> mesh signature at load / last export (track_edits)
         self.bounds = {}                     # part -> (min, max) from the GLB header when load_meshes=False
         self.placements, self.out, self.status = Path(placements), Path(out), Path(status)
         raw = self.placements.read_bytes()
@@ -95,21 +123,33 @@ class Batch:
                 lib.objects.link(o)
             lib.hide_viewport = lib.hide_render = True
         self.meshes = meshes
+        if track_edits:
+            self._sig = {p: mesh_sig(me) for p, me in meshes.items()}
         rx = re.compile(only_src) if only_src else None
         self.obj = {}
         for iid, rec in self.base.items():
             if rx and not rx.search(rec.get("src", "")):
                 continue
-            o = bpy.data.objects.new(iid, meshes.get(rec["part"]))      # mesh when the parts GLB is loaded, else an Empty
-            o["blsync_id"], o["blsync_part"] = iid, rec["part"]
-            o["blsync_era"], o["blsync_src"] = rec.get("era", "both"), rec.get("src", "")
-            o.matrix_world = mat_of(rec)
-            self.col.objects.link(o)
-            self.obj[iid] = o
+            self._spawn(iid)
         self.added = 0
         self.mesh_out = {}                   # part -> {"glb", "sha256"}: geometry sent to UE in this session
         self.rev = int(time.time())          # monotonic across restarts of the script
         bpy.context.view_layer.update()
+
+    def _spawn(self, iid):
+        """(re)create the object of a table instance: a mesh when the parts GLB is loaded, else an Empty."""
+        rec = self.base[iid]
+        o = bpy.data.objects.new(iid, self.meshes.get(rec["part"]))
+        o["blsync_id"], o["blsync_part"] = iid, rec["part"]
+        o["blsync_era"], o["blsync_src"] = rec.get("era", "both"), rec.get("src", "")
+        o.matrix_world = mat_of(rec)
+        self.col.objects.link(o)
+        self.obj[iid] = o
+        return o
+
+    def batch_of(self, iid):
+        """True when an id belongs to this batch (table ids and the <batch>_bl… ids made here)."""
+        return iid in self.base or str(iid).startswith(self.batch + "_bl")
 
     # ---- selection helpers
     def group(self, key):
@@ -197,7 +237,42 @@ class Batch:
         glb = d / f"{part}_{sha[:8]}.glb"
         os.replace(tmp, glb)
         self.mesh_out[part] = {"glb": str(glb), "sha256": sha}
+        if self._sig:
+            self._sig[part] = mesh_sig(me)
         return self.mesh_out[part]
+
+    def export_part_if_changed(self, part):
+        """export_part() only when the mesh differs from the load / last export (needs track_edits=True for the baseline;
+        without one it always exports). Returns the mesh entry, or None when nothing changed. Object mode only."""
+        if part not in self.meshes:
+            return None
+        if part in self._sig and mesh_sig(self.meshes[part]) == self._sig[part]:
+            return None
+        return self.export_part(part)
+
+    def adopt(self, o):
+        """give an object a new id of this batch (a Shift+D copy carries its source's blsync_id along)."""
+        self.added += 1
+        iid = f"{self.batch}_bl{int(time.time()) % 100000:05d}{self.added:03d}"
+        o["blsync_id"] = iid
+        o.name = iid
+        return iid
+
+    def fix_duplicates(self):
+        """the registered object keeps its id; every other object in the collection holding the same id gets a new one.
+        Returns the new ids."""
+        owner, fixed = {}, []
+        for o in self.col.objects:
+            iid = o.get("blsync_id")
+            if not iid:
+                continue
+            reg = self.obj.get(iid)
+            registered_elsewhere = reg is not None and alive(reg) and reg != o and reg.name in self.col.objects
+            if registered_elsewhere or iid in owner:
+                fixed.append(self.adopt(o))
+            else:
+                owner[iid] = o
+        return fixed
 
     def delete(self, objs):
         for o in objs:
@@ -220,11 +295,19 @@ class Batch:
     def reset(self, objs=None):
         if objs is None:
             self.mesh_out = {}               # back to the release geometry too
+            for iid, o in list(self.obj.items()):
+                if not alive(o) or o.name not in self.col.objects:     # deleted by hand (X) in Blender: bring it back
+                    self._spawn(iid)
         for o in (objs or list(self.col.objects)):
             iid = o.get("blsync_id")
+            if iid in self.base and objs is None and self.obj.get(iid) != o:
+                bpy.data.objects.remove(o)    # an unfixed Shift+D copy still carrying a table id
+                continue
             if iid in self.base:
                 o.matrix_world = mat_of(self.base[iid])
                 o["blsync_part"] = self.base[iid]["part"]
+                if o.type == "MESH" and self.base[iid]["part"] in self.meshes:
+                    o.data = self.meshes[self.base[iid]["part"]]
                 if "blsync_deleted" in o:
                     del o["blsync_deleted"]
                 o.hide_viewport = o.hide_render = False
@@ -256,35 +339,57 @@ class Batch:
             elif not moved:
                 continue
             inst[iid] = e
+        # loaded table instances whose object was deleted outright (X in Blender, not delete()) are deletions too
+        seen = {o.get("blsync_id") for o in self.col.objects}
+        for iid in self.obj:
+            if iid in self.base and iid not in seen:
+                inst[iid] = {"deleted": True}
         return inst
 
     def publish(self, label="", wait=30.0):
-        """write the cumulative override file; wait for UE's receipt (status.json with the same rev) up to `wait` s."""
+        """write the cumulative override file; wait for UE's receipt (status.json with the same rev) up to `wait` s.
+        = build() + deliver() + wait_receipt(); the add-on calls build() on Blender's main thread and the other two on a
+        worker thread, so pushing to the server never freezes the UI."""
+        ov = self.build(label)
+        res = self.deliver(ov)
+        res["ue"] = self.wait_receipt(ov, wait)
+        return res
+
+    def build(self, label=""):
+        """main thread only (reads bpy): the next override document; "meshes" holds local GLB paths."""
         inst = self.overrides()
         self.rev += 1
-        ov = {"schema": "renou-overrides/1", "batch": self.batch, "base_sha256": self.base_sha, "rev": self.rev,
-              "label": label, "written": time.time(), "instances": inst, "meshes": dict(self.mesh_out)}
+        return {"schema": "renou-overrides/1", "batch": self.batch, "base_sha256": self.base_sha, "rev": self.rev,
+                "label": label, "written": time.time(), "instances": inst,
+                "meshes": {p: {"glb": m["glb"], "sha256": m["sha256"]} for p, m in self.mesh_out.items()}}
+
+    def deliver(self, ov):
+        """any thread (no bpy): remote mode copies new meshes and points "meshes" at the server paths; then the file is
+        written atomically (locally, and pushed to the server in remote mode)."""
         self.out.parent.mkdir(parents=True, exist_ok=True)
         if self.remote:
-            ov["meshes"] = self._push_meshes()
+            ov["meshes"] = self._push_meshes(ov["meshes"])
             ov["written"] = time.time()
         tmp = self.out.with_suffix(".tmp")
         tmp.write_text(json.dumps(ov, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.out)
-        res = {"rev": self.rev, "overrides": len(inst), "ue": None}
+        res = {"rev": ov["rev"], "overrides": len(ov["instances"]), "ue": None}
         if self.remote:
             res["push_s"] = self._push_file(self.out)
+        return res
+
+    def wait_receipt(self, ov, wait=30.0):
+        """any thread: UE's status.json for this rev (or an error newer than the file), or None after `wait` s."""
         t0 = time.time()
         while wait and time.time() - t0 < wait:
             try:
                 st = json.loads(self._read_status())
             except Exception:
                 st = {}
-            if st.get("rev") == self.rev or (st.get("error") and st.get("t", 0) > ov["written"]):
-                res["ue"] = st
-                break
+            if st.get("rev") == ov["rev"] or (st.get("error") and st.get("t", 0) > ov["written"]):
+                return st
             time.sleep(0.5 if self.remote else 0.05)
-        return res
+        return None
 
     # ---- R7: laptop -> server with the system's scp / ssh
     def _split(self):
@@ -300,15 +405,15 @@ class Batch:
             subprocess.run(["ssh", host, f"cat > '{dst}.tmp' && mv '{dst}.tmp' '{dst}'"], stdin=fh, check=True)
         return round(time.time() - t, 2)
 
-    def _push_meshes(self):
+    def _push_meshes(self, meshes):
         host, path = self._split()
         out = {}
-        for part, m in self.mesh_out.items():
+        for part, m in meshes.items():
             rpath = f"{path}/meshes/{Path(m['glb']).name}"
-            if not m.get("pushed"):
+            if (part, m["sha256"]) not in self._pushed:
                 subprocess.run(["ssh", host, f"mkdir -p '{path}/meshes'"], check=True)
                 subprocess.run(["scp", "-q", m["glb"], f"{host}:{rpath}"], check=True)
-                m["pushed"] = True
+                self._pushed.add((part, m["sha256"]))
             out[part] = {"glb": rpath, "sha256": m["sha256"]}
         return out
 
