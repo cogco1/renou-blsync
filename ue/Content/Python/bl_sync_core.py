@@ -1,0 +1,641 @@
+"""人偶之心 · Blender→UE 实时预览 2026-10-09 (user: "脚本Blender做没问题，但需要在UE预览效果，这样快速迭代").
+UE side of the live link. Works on a batch that ct_placements.py already built (one HISM per part per era on the actors
+INST_<name>_<era>) and changes it in place: no re-import, no re-build, no level save. Imported once, kept in sys.modules,
+so the state survives between lk_session requests.
+
+The Blender side writes one override file per batch (schema renou-overrides/1, written atomically: tmp + rename). It is
+CUMULATIVE: everything that differs from the base placements table, so applying it is idempotent and an editor restart only
+needs attach + one apply.
+  {"schema": "renou-overrides/1", "batch": "area_04_03", "base_sha256": "<sha256 of the base placements json>",
+   "rev": 12, "written": <unix time>,
+   "instances": {"<id>": {"pos": [x, y, z], "quat_wxyz": [w, x, y, z], "scale": s | [sx, sy, sz],
+                          "part": "<part>"            (optional: swap the mesh)
+                          "deleted": true             (optional: hide it)
+                          "era": "both", "src": "..." (only for new ids: copies made in Blender)}},
+   "meshes": {"<part>": {"glb": "/abs/<part>.glb", "sha256": "..."}}   (optional: changed or new part geometry)}
+Coordinates as renou-placements/1: Blender metres, Z up -> UE cm (x, -y, z) x 100, quat_wxyz -> Quat(x, -y, z, -w).
+Hidden = scale 1e-4 at the same place (the slot is kept, indices never shift).
+Save guard (视效 10-09): while the preview differs from the table, the level files that hold the batch's HISMs are made
+read-only on disk, so nobody can save preview changes into the batch layer (a rebuild of that layer is blocked too);
+they get their write permission back as soon as the preview equals the table again (reset / empty override) or on detach.
+The list is kept in Saved/BlSync/guard.json, so detach also works after an editor restart.
+Ownership (user 10-09, as D5 LiveSync): Blender owns which part, where, rotation, scale and the part's geometry; UE owns
+materials, lights, post, vegetation, water, cameras. A sync never changes a UE-owned thing: when a part's mesh is replaced
+or an instance lands in a new HISM, every material slot keeps the material UE already shows for that slot name (component
+override or the batch's MI_C_ by ct_placements' rules); only slots UE has never seen fall back to the GLB's material."""
+import hashlib, json, math, os, re, runpy, time, traceback
+from pathlib import Path
+import unreal
+
+EAS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+UES = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+EAL = unreal.EditorAssetLibrary
+PROJ = Path(unreal.Paths.project_dir()).resolve()
+CTRL = PROJ / "Saved" / "BlSync"
+CTRL.mkdir(parents=True, exist_ok=True)
+HIDE = 1e-4
+TOL = 1e-4          # metres / quaternion units: below this two states count as equal
+
+S = {"batches": {}, "watch": None}
+GUARD = CTRL / "guard.json"
+LIVE_ROOT = "/Game/_LivePreview"        # single-part re-imports (in memory; if someone saves them they stay in this folder)   # name -> Batch; watch = {"path", "sig", "handle", "next", "interval"}
+
+
+_MI = {}
+
+
+def _norm(name):                                   # = lk_kit.norm
+    return re.sub(r"[^0-9a-z]", "", name.lower())
+
+
+def _stem(k):                                      # = ct_placements.stem
+    return re.sub(r"[._]?\d{1,3}$", "", k)
+
+
+def mi_for_slot(slot):
+    """the tuned MI_C_* ct_placements would give this slot name (same maps and ct_unmapped rules), or None."""
+    if "mm" not in _MI:
+        mm = {}
+        mats = EAL.list_assets("/Game/City2/Materials", recursive=False, include_folder=False) \
+            if EAL.does_directory_exist("/Game/City2/Materials") else []
+        for p in mats:
+            n = p.split("/")[-1].split(".")[0]
+            if n.startswith("MI_C_"):
+                mm[_norm(n[5:])] = p.split(".")[0]
+        st = {}
+        for key in sorted(mm):
+            st.setdefault(_stem(key), mm[key])
+        rules = []
+        f = Path(unreal.Paths.project_content_dir()) / "Python" / "ct_unmapped.py"
+        if mm and f.exists():
+            rules = runpy.run_path(str(f), init_globals={"REQUEST": {"apply": False, "dry": True}})["RULES"]
+        _MI.update(mm=mm, st=st, rules=rules)
+    k = _norm(slot)
+    p = _MI["mm"].get(k) or _MI["mm"].get(k[:52]) or _MI["st"].get(_stem(k)) or _MI["st"].get(_stem(k[:52]))
+    if not p:
+        hit = next((mi for rx, mi in _MI["rules"] if re.search(rx, slot.lower())), None)
+        if hit:
+            p = f"/Game/Terrain/Materials/{hit}" if hit.startswith("MI_CT_") else f"/Game/City2/Materials/{hit}"
+    return unreal.load_asset(p) if p and EAL.does_asset_exist(p) else None
+
+
+SLOT_TABLE_GLOB = "/workspace/guest/look-ue-20261008/live/handoff/slot_to_mi_v*.json"   # 视效 maintains it
+PLACEHOLDER = "/Engine/EngineDebugMaterials/M_GeoInsp_Zebra.M_GeoInsp_Zebra"         # loud: a slot nobody mapped yet
+
+
+def load_slot_table(path=None):
+    """视效's slot -> MI table (highest version unless a path is given): {raw name: entry} plus {norm: entry}."""
+    import glob
+    if not path:
+        files = sorted(glob.glob(SLOT_TABLE_GLOB), key=lambda f: int(re.search(r"_v(\d+)\.json$", f).group(1)))
+        path = files[-1] if files else None
+    if not path:
+        return None, {}, {}
+    slots = json.loads(Path(path).read_text(encoding="utf-8"))["slots"]
+    return path, slots, {v.get("norm") or _norm(k): v for k, v in slots.items()}
+
+
+def slot_names(mesh):
+    return [str(m.get_editor_property("material_slot_name")) for m in mesh.get_editor_property("static_materials")]
+
+
+def log(msg):
+    unreal.log("[BLSYNC] " + str(msg))
+
+
+def sha_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def norm_state(d):
+    """(part, era, pos, quat, scale3, deleted) from a placements / override record."""
+    if d is None:
+        return None
+    s = d.get("scale", 1.0)
+    s = [float(s)] * 3 if not isinstance(s, (list, tuple)) else [float(v) for v in s]
+    if d.get("quat_wxyz"):
+        q = [float(v) for v in d["quat_wxyz"]]
+    else:
+        h = math.radians(float(d.get("yaw_deg") or 0.0)) / 2
+        q = [math.cos(h), 0.0, 0.0, math.sin(h)]
+    if q[0] < 0:                                     # q and -q are the same rotation
+        q = [-v for v in q]
+    return {"part": d["part"], "era": d.get("era", "both"), "pos": [float(v) for v in d["pos"]], "quat": q,
+            "scale": s, "deleted": bool(d.get("deleted"))}
+
+
+def same(a, b):
+    if a is None or b is None:
+        return a is b
+    if a["part"] != b["part"] or a["deleted"] != b["deleted"] or a["era"] != b["era"]:
+        return False
+    return all(abs(x - y) < TOL for k in ("pos", "quat", "scale") for x, y in zip(a[k], b[k]))
+
+
+def ue_xf(st, hidden=False):
+    w, x, y, z = st["quat"]
+    rot = unreal.Quat(x, -y, z, -w).rotator()
+    s = [HIDE] * 3 if hidden else st["scale"]
+    p = st["pos"]
+    return unreal.Transform(location=unreal.Vector(p[0] * 100.0, -p[1] * 100.0, p[2] * 100.0), rotation=rot,
+                            scale=unreal.Vector(*s))
+
+
+def xf_err(t, st):
+    """largest location error in cm between a UE transform and a state (rotation via a 10 m test point)."""
+    want = ue_xf(st)
+    e = (t.translation - want.translation).length()
+    probe = unreal.Vector(1000.0, 1000.0, 1000.0)
+    e2 = (t.transform_location(probe) - want.transform_location(probe)).length()
+    return max(e, e2)
+
+
+def interchange_mesh(glb, folder):
+    """import one part GLB as plain Nanite static mesh(es) into folder, replacing assets of the same name in place."""
+    mgr = unreal.InterchangeManager.get_interchange_manager_scripted()
+    params = unreal.ImportAssetParameters()
+    params.set_editor_property("is_automated", True)
+    params.set_editor_property("replace_existing", True)
+    base = "DefaultGLTFAssetsPipeline"
+    pipe = unreal.SystemLibrary.duplicate_object(unreal.load_object(None, f"/Interchange/Pipelines/{base}.{base}"), mgr)
+    mp = pipe.get_editor_property("mesh_pipeline")
+    for k, v in (("build_nanite", True), ("generate_lightmap_u_vs", False), ("import_collision", False)):
+        try:
+            mp.set_editor_property(k, v)
+        except Exception:
+            pass
+    params.set_editor_property("override_pipelines", [
+        unreal.SoftObjectPath(pipe.get_path_name()),
+        unreal.SoftObjectPath("/Interchange/Pipelines/DefaultGLTFPipeline.DefaultGLTFPipeline")])
+    return mgr.import_asset(folder, mgr.create_source_data(str(glb)), params)
+
+
+class Batch:
+    def __init__(self, req):
+        t0 = time.time()
+        self.placements = Path(req["placements"])
+        self.data = json.loads(self.placements.read_text(encoding="utf-8-sig"))
+        assert self.data.get("schema") == "renou-placements/1", self.data.get("schema")
+        assert self.data.get("coord") == "blender_zup_m", self.data.get("coord")
+        self.base_sha = sha_file(self.placements)
+        self.name = req["name"]
+        self.dest = req.get("dest", f"/Game/Inst/{self.name}")
+        self.prefer = req.get("prefer", ["NEAR", "MID", "FAR"])
+        self.slot_table_path, self.slot_table, self.slot_table_norm = load_slot_table(req.get("slot_table"))
+        self.unmapped = set()                       # slots that got the placeholder (receipt: 视效 adds a table row)
+        self.meshes = {}
+        for p in EAL.list_assets(f"{self.dest}/parts", recursive=True, include_folder=False):
+            a = unreal.load_asset(p)
+            if isinstance(a, unreal.StaticMesh):
+                self.meshes[a.get_name().lower()] = a
+        self.hosts, self.comps = {}, {}             # era -> actor; (era, mesh path) -> HISM
+        for a in EAS.get_all_level_actors():
+            tags = [str(t) for t in a.tags]
+            if f"INST_{self.name}" not in tags or "CITY_INST_GROUND" in tags or "CITY_INST_FAR" in tags:
+                continue
+            era = a.get_actor_label().rsplit("_", 1)[-1]
+            self.hosts[era] = a
+            for c in a.get_components_by_class(unreal.HierarchicalInstancedStaticMeshComponent):
+                m = c.get_editor_property("static_mesh")
+                if m:
+                    self.comps[(era, m.get_path_name())] = c
+        assert self.hosts, f"no INST_{self.name}_* actors in the open level: build the batch with ct_placements first"
+        self.level_files = sorted({level_file(a) for a in self.hosts.values()} - {None})
+        # same grouping as ct_placements step 2: per (era, mesh) in table order -> instance index in that HISM
+        self.base, self.home, counter, skipped = {}, {}, {}, 0
+        for inst in self.data.get("instances", []):
+            st = norm_state(inst)
+            m = self.mesh_for(inst["part"], inst.get("lods"))
+            if m is None:
+                skipped += 1
+                continue
+            key = (st["era"], m.get_path_name())
+            idx = counter.get(key, 0)
+            counter[key] = idx + 1
+            self.base[inst["id"]] = st
+            self.home[inst["id"]] = (key, idx)
+        self.slot = dict(self.home)                 # id -> (comp key, index) where it lives now
+        self.free = {}                              # comp key -> indices we added and hid again (reusable)
+        self.applied = {}                           # id -> normalised override last applied
+        self.rev = None
+        self.mesh_sha = {}
+        self.keypath = {}                           # live mesh path -> the batch mesh path its HISMs are keyed by
+        self.mesh_orig = {}                         # part -> the batch's own mesh (to switch back on reset)
+        # verify the mapping against what is really in the level
+        worst, bad, missing_comp = 0.0, 0, 0
+        for iid, (key, idx) in self.home.items():
+            c = self.comps.get(key)
+            if c is None:
+                missing_comp += 1
+                continue
+            if idx >= c.get_instance_count():
+                bad += 1
+                continue
+            e = xf_err(c.get_instance_transform(idx, True), self.base[iid])
+            worst = max(worst, e)
+            bad += e > 1.0
+        self.report = {"batch": self.data.get("batch"), "instances": len(self.base), "skipped_no_mesh": skipped,
+                       "hism": len(self.comps), "verify_bad": bad, "verify_worst_cm": round(worst, 3),
+                       "missing_comp": missing_comp, "slot_table": self.slot_table_path, "seconds": round(time.time() - t0, 2)}
+        assert bad == 0 and missing_comp == 0, f"level does not match the placements table: {self.report}"
+
+    def mesh_for(self, part, lods=None, fallback=False):
+        # identical to ct_placements.mesh_for for the base table; fallback (overrides only) also tries the NEAR mesh
+        for lod in [x for x in self.prefer if x in (lods or ["NEAR"])] + (["NEAR"] if fallback else []):
+            m = self.meshes.get((part if lod == "NEAR" else f"{part}_{lod}").lower())
+            if m:
+                return m
+        return None
+
+    def ue_material(self, slot):
+        """(material, how) for a slot that has no same-name slot on the replaced mesh. Order (视效 10-09):
+        1. the material UE already shows for this slot name somewhere in the batch ("ue");
+        2. 视效's slot table: MI_C_* ("table") or KEEP_GLB = the import's own material (None, "keep");
+        3. slot not in the table: loud placeholder, listed in the receipt ("placeholder"). No table at all: ct_placements'
+           rules ("rule") or the import's material."""
+        if not hasattr(self, "_slotmat"):
+            self._slotmat = {}
+            for c in self.comps.values():
+                m = c.get_editor_property("static_mesh")
+                for i, n in enumerate(slot_names(m) if m else []):
+                    self._slotmat.setdefault(_norm(n), c.get_material(i))
+        k = _norm(slot)
+        m = self._slotmat.get(k)
+        if m is not None:
+            return m, "ue"
+        e = self.slot_table.get(slot) or self.slot_table_norm.get(k)
+        if e is not None:
+            if e.get("mi") == "KEEP_GLB":
+                return None, "keep"
+            p = e["mi"]
+            if EAL.does_asset_exist(p.split(".")[0]):
+                return unreal.load_asset(p), "table"
+        if self.slot_table_path:
+            self.unmapped.add(slot)
+            return unreal.load_asset(PLACEHOLDER), "placeholder"
+        m = mi_for_slot(slot)
+        return (m, "rule") if m is not None else (None, "keep")
+
+    def carry_materials(self, comp, old_mesh, new_mesh):
+        """switch comp to new_mesh; a slot with the same name as on the old mesh keeps exactly the material UE showed
+        there ("carried"); other slots go through ue_material(). Returns {slot: [material or "glb", how]}."""
+        before = {_norm(n): comp.get_material(i) for i, n in enumerate(slot_names(old_mesh))} if old_mesh else {}
+        comp.set_static_mesh(new_mesh)
+        rep = {}
+        for j, n in enumerate(slot_names(new_mesh)):
+            m = before.get(_norm(n))
+            how = "carried"
+            if m is None:
+                m, how = self.ue_material(n)
+            if m is not None:
+                comp.set_material(j, m)
+            rep[n] = [m.get_path_name() if m else "glb", how]
+        return rep
+
+    def comp_for(self, era, mesh):
+        path = mesh.get_path_name()
+        key = (era, self.keypath.get(path, path))
+        if key in self.comps:
+            return key
+        host = self.hosts.get(era)
+        if host is None:                            # new era host, same tags as ct_placements, in the batch's own level
+            any_host = next(iter(self.hosts.values()))
+            ELU, LES = unreal.EditorLevelUtils, unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+            cur = LES.get_current_level()           # VFX's current level comes back right after the spawn
+            ELU.make_level_current(any_host.get_outer())
+            try:
+                host = EAS.spawn_actor_from_class(unreal.Actor, unreal.Vector(0, 0, 0), unreal.Rotator(0, 0, 0))
+            finally:
+                ELU.make_level_current(cur)
+            host.set_actor_label(f"INST_{self.name}_{era}")
+            host.set_folder_path(f"City_Inst/{self.name}")
+            tg = ["CITY_INST", f"INST_{self.name}"] + ([f"CITY_ERA_{era}"] if era in ("past", "present") else [])
+            host.set_editor_property("tags", [unreal.Name(x) for x in tg])
+            self.hosts[era] = host
+        sub = unreal.get_engine_subsystem(unreal.SubobjectDataSubsystem)
+        BL = unreal.SubobjectDataBlueprintFunctionLibrary
+        root = sub.k2_gather_subobject_data_for_instance(host)[0]
+        handle, _ = sub.add_new_subobject(unreal.AddNewSubobjectParams(
+            parent_handle=root, new_class=unreal.HierarchicalInstancedStaticMeshComponent, blueprint_context=None))
+        comp = BL.get_object(BL.get_data(handle))
+        self.last_slots = self.carry_materials(comp, None, mesh)
+        self.comps[key] = comp
+        return key
+
+    def revert_meshes(self, keep, out):
+        """parts no longer listed in the override's "meshes": HISMs back to the batch's own mesh."""
+        for part in [p for p in self.mesh_sha if p not in keep]:
+            live, orig = self.meshes.get(part.lower()), self.mesh_orig.get(part)
+            if orig is not None and live is not None:
+                lp = live.get_path_name()
+                for c in self.comps.values():
+                    m = c.get_editor_property("static_mesh")
+                    if m and m.get_path_name() == lp:
+                        self.carry_materials(c, m, orig)
+                self.meshes[part.lower()] = orig
+            else:
+                self.meshes.pop(part.lower(), None)
+            del self.mesh_sha[part]
+            out.setdefault("meshes_reverted", []).append(part)
+
+    def update_meshes(self, meshes, out):
+        """changed or new part geometry: import the part GLB into its own folder /parts_live/<part>_<sha8>, then point
+        every HISM that shows the part at the new mesh (instances, indices and material overrides stay). The batch's
+        original asset is left as it is; HISM keys keep the original mesh path (keypath alias)."""
+        for part, info in (meshes or {}).items():
+            glb = Path(info["glb"])
+            want = info.get("sha256")
+            if want and self.mesh_sha.get(part) == want:
+                continue
+            got = sha_file(glb)
+            if want and got != want:
+                out.setdefault("errors", []).append(f"mesh {part}: sha {got[:12]} != {want[:12]} (file still being written?)")
+                continue
+            t = time.time()
+            folder = f"{LIVE_ROOT}/{self.name}/{part}_{got[:8]}"     # R3: preview assets apart, never in a batch folder
+            found = []
+            if EAL.does_directory_exist(folder):
+                found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
+            if not any(isinstance(a, unreal.StaticMesh) for a in found):
+                interchange_mesh(glb, folder)
+                found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
+            sms = [a for a in found if isinstance(a, unreal.StaticMesh)]
+            new = next((a for a in sms if a.get_name().lower() == part.lower()), sms[0] if len(sms) == 1 else None)
+            if new is None:
+                out.setdefault("errors", []).append(f"mesh {part}: {len(sms)} static meshes in {glb.name}, none named {part}")
+                continue
+            old = self.meshes.get(part.lower())
+            if old is not None and part not in self.mesh_orig:
+                self.mesh_orig[part] = old
+            swapped, slots = 0, None
+            if old:
+                op = old.get_path_name()
+                slots = None
+                for c in self.comps.values():
+                    m = c.get_editor_property("static_mesh")
+                    if m and m.get_path_name() == op:
+                        slots = self.carry_materials(c, m, new)
+                        swapped += 1
+                self.keypath[new.get_path_name()] = self.keypath.get(op, op)
+            self.meshes[part.lower()] = new
+            self.mesh_sha[part] = got
+            tri = new.get_num_triangles(0) if hasattr(new, "get_num_triangles") else None
+            out.setdefault("meshes", []).append({"part": part, "new_part": old is None, "hism_switched": swapped,
+                                                  "slots": slots if old else None,
+                                                  "asset": new.get_path_name(), "triangles": tri,
+                                                  "seconds": round(time.time() - t, 2)})
+
+    def place(self, iid, st):
+        """move instance iid to state st (None = remove an added one, deleted = hide)."""
+        cur = self.slot.get(iid)
+        if st is None or st["deleted"]:
+            if cur:
+                key, idx = cur
+                self.comps[key].update_instance_transform(idx, ue_xf(self.base.get(iid) or self.applied[iid], True), True, True, True)
+                if cur != self.home.get(iid):
+                    self.free.setdefault(key, []).append(idx)
+                    del self.slot[iid]
+            return "hidden"
+        mesh = self.mesh_for(st["part"], fallback=True)
+        if mesh is None:
+            raise KeyError(f"part {st['part']} has no mesh in {self.dest}/parts (send it in 'meshes')")
+        key = self.comp_for(st["era"], mesh)
+        if cur and cur[0] == key:
+            self.comps[key].update_instance_transform(cur[1], ue_xf(st), True, True, True)
+            return "moved"
+        if cur:                                     # part swap: hide the old slot
+            okey, oidx = cur
+            self.comps[okey].update_instance_transform(oidx, ue_xf(st, True), True, True, True)
+            if cur != self.home.get(iid):
+                self.free.setdefault(okey, []).append(oidx)
+        home = self.home.get(iid)
+        if home and home[0] == key:
+            idx = home[1]
+            self.comps[key].update_instance_transform(idx, ue_xf(st), True, True, True)
+        elif self.free.get(key):
+            idx = self.free[key].pop()
+            self.comps[key].update_instance_transform(idx, ue_xf(st), True, True, True)
+        else:
+            idx = self.comps[key].add_instance(ue_xf(st), True)
+        self.slot[iid] = (key, idx)
+        return "swapped" if cur else "added"
+
+    def apply(self, ov):
+        t0 = time.time()
+        out = {"rev": ov.get("rev"), "written": ov.get("written")}
+        if ov.get("base_sha256") and ov["base_sha256"] != self.base_sha:
+            raise ValueError(f"override base {ov['base_sha256'][:12]} != loaded table {self.base_sha[:12]}")
+        self.revert_meshes(set(ov.get("meshes") or {}), out)
+        self.update_meshes(ov.get("meshes"), out)
+        new = {}
+        for iid, d in (ov.get("instances") or {}).items():
+            b = self.base.get(iid)
+            merged = dict({"part": b["part"], "era": b["era"], "pos": b["pos"], "quat_wxyz": b["quat"], "scale": b["scale"]} if b else {}, **d)
+            new[iid] = norm_state(merged)
+        counts = {}
+        for iid in set(self.applied) | set(new):
+            want = new.get(iid) or self.base.get(iid)   # dropped from the file: back to the table (or gone if it was new)
+            have = self.applied.get(iid) or self.base.get(iid)
+            if same(want, have) and (want is None or iid in self.slot or want["deleted"]):
+                continue
+            try:
+                r = self.place(iid, want)
+                counts[r] = counts.get(r, 0) + 1
+            except Exception as exc:
+                out.setdefault("errors", []).append(f"{iid}: {exc}")
+        self.applied = {k: v for k, v in new.items()}
+        self.rev = ov.get("rev")
+        out["save_guard"] = guard(self.level_files, bool(self.applied or self.mesh_sha))
+        if self.unmapped:
+            out["unmapped_slots"] = sorted(self.unmapped)
+        out.update(counts=counts, overrides=len(new), seconds=round(time.time() - t0, 3))
+        return out
+
+
+def level_file(actor):
+    """the .umap on disk that holds this actor (persistent level or streamed sublevel), or None."""
+    try:
+        world_path = actor.get_outer().get_outer().get_path_name().split(".")[0]      # /Game/Inst/x/L_x
+    except Exception:
+        return None
+    if not world_path.startswith("/Game/"):
+        return None
+    f = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())) / (world_path[6:] + ".umap")
+    return str(f.resolve()) if f.exists() else None
+
+
+def _guard_state():
+    try:
+        return json.loads(GUARD.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def guard(files, on):
+    """make the files read-only (on) or give back the mode they had before (off). Returns the files now guarded."""
+    st = _guard_state()
+    for f in files:
+        if on and f not in st:
+            mode = os.stat(f).st_mode & 0o7777
+            st[f] = mode
+            os.chmod(f, mode & ~0o222)
+        elif not on and f in st:
+            os.chmod(f, st.pop(f))
+    GUARD.write_text(json.dumps(st, indent=1), encoding="utf-8")
+    return sorted(k for k in st if k in files)
+
+
+def attach(req):
+    b = Batch(req)
+    S["batches"][b.name] = b
+    log(f"attached {b.name}: {b.report}")
+    return b.report
+
+
+def apply_file(path, name=None):
+    ov = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    assert ov.get("schema") == "renou-overrides/1", ov.get("schema")
+    b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
+    assert b is not None, f"batch {ov.get('batch')} not attached"
+    out = b.apply(ov)
+    out["applied_at"] = time.time()
+    if out.get("written"):
+        out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)
+    (CTRL / "status.tmp").write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    (CTRL / "status.tmp").replace(CTRL / "status.json")
+    return out
+
+
+def _watch_tick(dt):
+    w = S["watch"]
+    if not w or time.monotonic() < w["next"]:
+        return
+    w["next"] = time.monotonic() + w["interval"]
+    for path in w["paths"]:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            continue
+        sig = (st.st_mtime_ns, st.st_size)
+        if w["sig"].get(path) == sig:
+            continue
+        w["sig"][path] = sig
+        try:
+            out = apply_file(path)
+            log(f"applied {Path(path).name} rev {out.get('rev')}: {out.get('counts')} in {out.get('seconds')} s")
+        except Exception:
+            err = traceback.format_exc()
+            unreal.log_error("[BLSYNC] " + err)
+            (CTRL / "status.json").write_text(json.dumps({"error": err, "file": path, "t": time.time()}), encoding="utf-8")
+
+
+def watch(paths, interval=0.2):
+    unwatch()
+    S["watch"] = {"paths": [str(p) for p in paths], "sig": {}, "next": 0.0, "interval": float(interval)}
+    S["watch"]["handle"] = unreal.register_slate_post_tick_callback(_watch_tick)
+    return {"watching": S["watch"]["paths"], "interval": interval}
+
+
+def unwatch():
+    w = S.get("watch")
+    if w and w.get("handle"):
+        unreal.unregister_slate_post_tick_callback(w["handle"])
+    S["watch"] = None
+    return {"watching": []}
+
+
+def reset(name):
+    """everything back to the base table (an empty override): positions, parts and live meshes; files writable again."""
+    b = S["batches"][name]
+    return b.apply({"rev": "reset", "instances": {}, "meshes": {}})
+
+
+def detach(name=None):
+    """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch."""
+    unwatch()
+    out = {}
+    for n in ([name] if name else list(S["batches"])):
+        if n in S["batches"]:
+            out[n] = reset(n)
+            del S["batches"][n]
+    left = _guard_state()
+    guard(list(left), False)                      # also files guarded by an earlier editor session
+    out["unguarded"] = sorted(left)
+    return out
+
+
+def _txt(v):
+    """stable text of a value (UE structs print their memory address with str())."""
+    try:
+        return v.export_text()
+    except Exception:
+        return repr(round(v, 6)) if isinstance(v, float) else str(v)
+
+
+def fingerprint():
+    """R2 check: what UE owns, before and after a sync must be identical. Counts and key values of lights, sky, fog,
+    post, clouds, water, foliage / grass, cameras, plus a hash of the materials on every HISM slot NOT touched by bl_sync."""
+    out, rows = {}, []
+    keys = {"DirectionalLight": ("DirectionalLightComponent", ["intensity", "light_color", "temperature"]),
+            "SkyLight": ("SkyLightComponent", ["intensity"]), "SkyAtmosphere": ("SkyAtmosphereComponent", ["mie_scattering_scale"]),
+            "ExponentialHeightFog": ("ExponentialHeightFogComponent", ["fog_density", "fog_height_falloff"]),
+            "PostProcessVolume": (None, ["blend_weight"]), "VolumetricCloud": ("VolumetricCloudComponent", ["layer_bottom_altitude"]),
+            "CineCameraActor": (None, []), "InstancedFoliageActor": (None, []), "WaterBody": (None, []), "Landscape": (None, [])}
+    touched = set()
+    for b in S["batches"].values():
+        touched |= {c.get_path_name() for c in b.comps.values()}
+    nmat = 0
+    for a in EAS.get_all_level_actors():
+        cls = a.get_class().get_name()
+        k = next((x for x in keys if cls.startswith(x)), None)
+        if k is not None:
+            out[k] = out.get(k, 0) + 1
+            comp_name, props = keys[k]
+            obj = a.get_component_by_class(getattr(unreal, comp_name)) if comp_name else a
+            vals = []
+            for pr in props:
+                try:
+                    vals.append(_txt(obj.get_editor_property(pr)))
+                except Exception:
+                    pass
+            t = a.get_actor_transform()
+            rows.append(f"{a.get_path_name()}|{_txt(t.translation)}|{_txt(t.rotation.rotator())}|{vals}")
+        for c in a.get_components_by_class(unreal.StaticMeshComponent):
+            if c.get_path_name() in touched:
+                continue
+            mats = [(c.get_material(i).get_path_name() if c.get_material(i) else "-") for i in range(c.get_num_materials())]
+            rows.append(f"{c.get_path_name()}|{mats}")
+            nmat += len(mats)
+    rows.sort()
+    out["other_mesh_slots"] = nmat
+    out["sha"] = hashlib.sha256(chr(10).join(rows).encode()).hexdigest()[:16]
+    out["rows"] = {r.split("|")[0].rsplit(".", 1)[-1]: hashlib.sha256(r.encode()).hexdigest()[:8] for r in rows}
+    return out
+
+
+def materials(name, ids):
+    """per instance: the mesh UE shows and the material on every slot (acceptance: same before / after a sync)."""
+    b = S["batches"][name]
+    out = {}
+    for iid in ids:
+        key, idx = b.slot[iid]
+        c = b.comps[key]
+        m = c.get_editor_property("static_mesh")
+        out[iid] = {"mesh": m.get_name(), "slots": {n: (c.get_material(i).get_path_name() if c.get_material(i) else None)
+                                                   for i, n in enumerate(slot_names(m))}}
+    return out
+
+
+def where(name, iid):
+    """world bounds centre (Blender metres) and yaw of one instance as UE shows it now."""
+    b = S["batches"][name]
+    key, idx = b.slot[iid]
+    comp = b.comps[key]
+    t = comp.get_instance_transform(idx, True)
+    c = t.transform_location(comp.get_editor_property("static_mesh").get_bounds().origin)
+    return {"centre_m": [round(c.x / 100, 3), round(-c.y / 100, 3), round(c.z / 100, 3)],
+            "yaw_ue": round(t.rotation.rotator().yaw, 3), "scale": [round(v, 4) for v in (t.scale3d.x, t.scale3d.y, t.scale3d.z)]}

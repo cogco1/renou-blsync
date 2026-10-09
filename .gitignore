@@ -1,0 +1,22 @@
+# build / test output
+build/
+__pycache__/
+*.pyc
+*.tmp
+
+# never commit game assets or real data (see CONTRIBUTING.md)
+*.glb
+*.gltf
+*.blend
+*.blend1
+*.fbx
+*.uasset
+*.umap
+*.png
+*.jpg
+*.exr
+*_placements*.json
+*_overrides*.json
+status.json
+data/
+meshes/
