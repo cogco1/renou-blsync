@@ -154,16 +154,26 @@ def xf_err(t, st):
     return max(e, e2)
 
 
-def glb_material_names(glb):
-    """material names of a GLB, read from its JSON chunk only (= the slot names UE will give the mesh, before sanitising)."""
+def glb_materials(glb):
+    """{material name: has a texture} from a GLB's JSON chunk only (the names = the slot names UE gives the mesh,
+    before sanitising)."""
     import struct
     with open(glb, "rb") as fh:
         magic, _v, _n = struct.unpack("<4sII", fh.read(12))
         if magic != b"glTF":
-            return []
+            return {}
         clen, _t = struct.unpack("<II", fh.read(8))
         g = json.loads(fh.read(clen))
-    return [m.get("name", "") for m in g.get("materials", [])]
+    out = {}
+    for m in g.get("materials", []):
+        pbr = m.get("pbrMetallicRoughness", {})
+        out[m.get("name", "")] = bool(pbr.get("baseColorTexture") or pbr.get("metallicRoughnessTexture")
+                                      or m.get("normalTexture") or m.get("emissiveTexture"))
+    return out
+
+
+def glb_material_names(glb):
+    return list(glb_materials(glb))
 
 
 def interchange_mesh(glb, folder, preview=True, materials=False):
@@ -275,11 +285,15 @@ class Batch:
         return None
 
     def ue_material(self, slot):
-        """(material, how) for a slot that has no same-name slot on the replaced mesh. Order (视效 10-09):
-        1. the material UE already shows for this slot name somewhere in the batch ("ue");
-        2. 视效's slot table: MI_C_* ("table") or KEEP_GLB = the import's own material (None, "keep");
-        3. slot not in the table: loud placeholder, listed in the receipt ("placeholder"). No table at all: ct_placements'
-           rules ("rule") or the import's material."""
+        """(material, how) for a slot that has no same-name slot on the replaced mesh. Order (视效's rule, 10-09):
+        1. 视效's slot table: MI_C_* ("table"), or KEEP_GLB = the import's own material (None, "keep"). A table entry that
+           only came from a regex rule does not win over a texture: when the incoming GLB material of that slot has a
+           texture, it is kept ("keep_textured") - generic names such as Material_0 mean different things in every
+           Meshy model, the table maps Material_0 to concrete by rule;
+        2. slot not in the table: the material UE already shows for this slot name in the batch ("ue"), unless the
+           incoming material is textured (then its own, "keep_textured");
+        3. otherwise a loud placeholder, listed in the receipt ("placeholder"). No table at all: ct_placements' rules
+           ("rule") or the import's material."""
         if not hasattr(self, "_slotmat"):
             self._slotmat = {}
             for c in self.comps.values():
@@ -287,16 +301,21 @@ class Batch:
                 for i, n in enumerate(slot_names(m) if m else []):
                     self._slotmat.setdefault(_norm(n), c.get_material(i))
         k = _norm(slot)
-        m = self._slotmat.get(k)
-        if m is not None:
-            return m, "ue"
+        textured = k in getattr(self, "textured_now", set())
         e = self.slot_table.get(slot) or self.slot_table_norm.get(k)
         if e is not None:
             if e.get("mi") == "KEEP_GLB":
                 return None, "keep"
+            if textured and e.get("how") not in ("exact", "stem"):
+                return None, "keep_textured"
             p = e["mi"]
             if EAL.does_asset_exist(p.split(".")[0]):
                 return unreal.load_asset(p), "table"
+        if textured:
+            return None, "keep_textured"
+        m = self._slotmat.get(k)
+        if m is not None:
+            return m, "ue"
         if self.slot_table_path:
             self.unmapped.add(slot)
             return unreal.load_asset(PLACEHOLDER), "placeholder"
@@ -311,7 +330,7 @@ class Batch:
             if k in old:
                 continue
             m, how = self.ue_material(n)
-            if how == "keep":
+            if how in ("keep", "keep_textured"):
                 return True
         self.unmapped -= {n for n in names}         # ue_material() above only looked; the real assignment reports again
         return False
@@ -320,6 +339,7 @@ class Batch:
         """switch comp to new_mesh; a slot with the same name as on the old mesh keeps exactly the material UE showed
         there ("carried"); other slots go through ue_material(). Returns {slot: [material or "glb", how]}."""
         before = {_norm(n): comp.get_material(i) for i, n in enumerate(slot_names(old_mesh))} if old_mesh else {}
+        self.textured_now = getattr(self, "textured_by_mesh", {}).get(new_mesh.get_path_name(), set())
         comp.set_static_mesh(new_mesh)
         rep = {}
         for j, n in enumerate(slot_names(new_mesh)):
@@ -396,7 +416,10 @@ class Batch:
             found = []
             if EAL.does_directory_exist(folder):
                 found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
-            need_mats = self.needs_glb_materials(glb_material_names(glb), self.meshes.get(part.lower()))
+            gm = glb_materials(glb)
+            textured = {_norm(n) for n, tex in gm.items() if tex}
+            self.textured_now = textured
+            need_mats = self.needs_glb_materials(list(gm), self.meshes.get(part.lower()))
             if not any(isinstance(a, unreal.StaticMesh) for a in found):
                 interchange_mesh(glb, folder, materials=need_mats)
                 found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
@@ -405,6 +428,9 @@ class Batch:
             if new is None:
                 out.setdefault("errors", []).append(f"mesh {part}: {len(sms)} static meshes in {glb.name}, none named {part}")
                 continue
+            if not hasattr(self, "textured_by_mesh"):
+                self.textured_by_mesh = {}
+            self.textured_by_mesh[new.get_path_name()] = textured
             old = self.meshes.get(part.lower())
             if old is not None and part not in self.mesh_orig:
                 self.mesh_orig[part] = old
@@ -454,6 +480,7 @@ class Batch:
                 c.remove_instances(list(range(n0, n)))
                 out["instances_removed"] = out.get("instances_removed", 0) + n - n0
         self.free, self.slot = {}, dict(self.home)
+        self.unmapped = set()                       # nothing of the preview is shown any more
         if hasattr(self, "slot_comp"):
             self.slot_comp = {k: v for k, v in self.slot_comp.items() if v in self.comps}
         return out
