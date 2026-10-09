@@ -23,11 +23,11 @@ import bl_sync_core as core
 
 REQ = globals().get("REQUEST", {}) or {}
 act = REQ.get("action", "status")
-if act in core.ACTIONS:                               # the same code the control channel runs
-    REPORT = core.dispatch(REQ)
-elif act == "reload":
+if act == "reload":                                   # first: the cached core may be older than this file
     core.detach()
     REPORT = {"reloaded": importlib.reload(core).__file__}
+elif act in getattr(core, "ACTIONS", ()):            # the same code the control channel runs
+    REPORT = core.dispatch(REQ)
 elif act == "attach":
     REPORT = core.attach(REQ)
 elif act == "apply":
