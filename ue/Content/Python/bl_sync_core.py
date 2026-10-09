@@ -81,6 +81,7 @@ def mi_for_slot(slot):
 
 SLOT_TABLE_GLOB = "/workspace/guest/look-ue-20261008/live/handoff/slot_to_mi_v*.json"   # 视效 maintains it
 PLACEHOLDER = "/Engine/EngineDebugMaterials/M_GeoInsp_Zebra.M_GeoInsp_Zebra"         # loud: a slot nobody mapped yet
+GENERIC_SLOT = re.compile(r"^material(_0)?([._ ]\d+)?$")   # = ct_placements 10-09: keep when the import has a texture
 
 
 def load_slot_table(path=None):
@@ -286,12 +287,13 @@ class Batch:
 
     def ue_material(self, slot):
         """(material, how) for a slot that has no same-name slot on the replaced mesh. Order (视效's rule, 10-09):
-        1. 视效's slot table: MI_C_* ("table"), or KEEP_GLB = the import's own material (None, "keep"). A table entry that
-           only came from a regex rule does not win over a texture: when the incoming GLB material of that slot has a
-           texture, it is kept ("keep_textured") - generic names such as Material_0 mean different things in every
-           Meshy model, the table maps Material_0 to concrete by rule;
-        2. slot not in the table: the material UE already shows for this slot name in the batch ("ue"), unless the
-           incoming material is textured (then its own, "keep_textured");
+        1. 视效's slot table: MI_C_* ("table"), or KEEP_GLB = the import's own material (None, "keep"). Entries marked
+           "keep_if_textured" (the generic Material_0 / Material_0.00N names: every Meshy model has its own) keep the
+           import's material when the incoming GLB material has a texture ("keep_textured"); every other entry wins
+           even over a texture (F5_*, C__Harbor_*: the formal import maps them to MI_C_ too);
+        2. slot not in the table: a generic name (GENERIC_SLOT: Material, Material_0, Material_0.001 ...) with a texture keeps its own material,
+           the same rule ct_placements uses since 10-09 ("keep_textured"); otherwise the material UE already shows
+           for this slot name in the batch ("ue");
         3. otherwise a loud placeholder, listed in the receipt ("placeholder"). No table at all: ct_placements' rules
            ("rule") or the import's material."""
         if not hasattr(self, "_slotmat"):
@@ -306,12 +308,12 @@ class Batch:
         if e is not None:
             if e.get("mi") == "KEEP_GLB":
                 return None, "keep"
-            if textured and e.get("how") not in ("exact", "stem"):
+            if textured and e.get("keep_if_textured"):
                 return None, "keep_textured"
             p = e["mi"]
             if EAL.does_asset_exist(p.split(".")[0]):
                 return unreal.load_asset(p), "table"
-        if textured:
+        if textured and GENERIC_SLOT.match(slot.lower()):
             return None, "keep_textured"
         m = self._slotmat.get(k)
         if m is not None:
