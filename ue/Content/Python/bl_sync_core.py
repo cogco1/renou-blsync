@@ -135,8 +135,13 @@ def norm_state(d):
     else:
         h = math.radians(float(d.get("yaw_deg") or 0.0)) / 2
         q = [math.cos(h), 0.0, 0.0, math.sin(h)]
-    if q[0] < 0:                                     # q and -q are the same rotation
-        q = [-v for v in q]
+    n = math.sqrt(sum(v * v for v in q)) or 1.0      # table quaternions carry 7 decimals: make them unit
+    q = [v / n for v in q]
+    for c in q:                                      # q and -q are the same rotation: first clearly non-zero
+        if abs(c) > 1e-6:                            # component positive (w alone is not enough when w = 0, #31)
+            if c < 0:
+                q = [-v for v in q]
+            break
     return {"part": d["part"], "era": d.get("era", "both"), "pos": [float(v) for v in d["pos"]], "quat": q,
             "scale": s, "deleted": bool(d.get("deleted"))}
 
@@ -146,7 +151,9 @@ def same(a, b):
         return a is b
     if a["part"] != b["part"] or a["deleted"] != b["deleted"] or a["era"] != b["era"]:
         return False
-    return all(abs(x - y) < TOL for k in ("pos", "quat", "scale") for x, y in zip(a[k], b[k]))
+    if abs(sum(x * y for x, y in zip(a["quat"], b["quat"]))) < 1.0 - 1e-9:     # rotations compared as rotations
+        return False
+    return all(abs(x - y) < TOL for k in ("pos", "scale") for x, y in zip(a[k], b[k]))
 
 
 def ue_xf(st, hidden=False):

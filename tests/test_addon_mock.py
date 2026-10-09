@@ -53,7 +53,7 @@ try:
     s.writeback_dir = str(out / "write_back")
     check("attach operator", bpy.ops.renou.attach() == {"FINISHED"})
     B = state.BATCHES["test_01"]
-    check("attach: 25 instances, part meshes loaded", len(B.obj) == 25 and len(B.meshes) == 5, (len(B.obj), len(B.meshes)))
+    check("attach: 26 instances, part meshes loaded", len(B.obj) == 26 and len(B.meshes) == 5, (len(B.obj), len(B.meshes)))
 
     s.live = True                                   # the panel toggle: starts the timer and the worker
     check("live switch on", state.LIVE and bpy.app.timers.is_registered(live.tick))
@@ -99,7 +99,7 @@ try:
 
     check("write-back operator", bpy.ops.renou.write_back() == {"FINISHED"})
     tab = json.loads(next((out / "write_back").glob("test_01_placements_v*.json")).read_text(encoding="utf-8"))
-    check("write-back: 25 - 1 deleted + 1 added = 25 rows", tab["count"] == 25, tab["count"])
+    check("write-back: 26 - 1 deleted + 1 added = 26 rows", tab["count"] == 26, tab["count"])
 
     s.live = False
     check("live switch off stops the timer", not state.LIVE and not bpy.app.timers.is_registered(live.tick))

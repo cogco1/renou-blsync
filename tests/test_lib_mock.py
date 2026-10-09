@@ -40,6 +40,7 @@ def receipt_ok(r):
 try:
     # fast mode: Empties only, part bounds read from the GLB header
     Bf = rb.Batch(P, out=out / "fast_overrides.json", parts_glb=G, status=ST, load_meshes=False)
+    check("fast mode baseline: no overrides, also for the w = 0 row (#31)", Bf.overrides() == {}, list(Bf.overrides())[:3])
     c = Bf.centre(Bf.group("BLK_BAKED"), base=False)
     check("fast mode: world-baked block centre from the GLB header", (c - Vector((110, 60, 20))).length < 1e-3, tuple(c))
 

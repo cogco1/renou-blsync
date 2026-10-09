@@ -55,11 +55,25 @@ def mat_of(rec):
     return Matrix.LocRotScale(Vector(rec["pos"]), q, s)
 
 
+def canon(q):
+    """q and -q are the same rotation: make the first clearly non-zero component (w, x, y, z) positive. "w < 0" alone
+    is not enough - a 180 deg turn about a horizontal axis has w = 0 and its sign is then decided by x / y / z (#31)."""
+    for c in (q.w, q.x, q.y, q.z):
+        if abs(c) > 1e-6:
+            if c < 0:
+                q.negate()
+            break
+    return q
+
+
+def same_rotation(a, b, eps=1e-9):
+    """True when two unit quaternions are the same rotation, whatever their signs (|a.b| = cos of half the angle)."""
+    return abs(a.normalized().dot(b.normalized())) > 1.0 - eps   # table quaternions carry 7 decimals: not exactly unit
+
+
 def decompose(m):
     loc, q, s = m.decompose()
-    if q.w < 0:
-        q.negate()
-    return loc, q, s
+    return loc, canon(q), s
 
 
 def mesh_sig(me):
@@ -421,7 +435,7 @@ class Batch:
                 inst[iid] = dict(e, part=o["blsync_part"], era=o["blsync_era"], src=o["blsync_src"])
                 continue
             bl, bq, bs = decompose(mat_of(rec))
-            moved = (loc - bl).length > 1e-4 or bq.rotation_difference(q).angle > 1e-5 or (s - bs).length > 1e-5
+            moved = (loc - bl).length > 1e-4 or not same_rotation(bq, q) or (s - bs).length > 1e-5
             if o["blsync_part"] != rec["part"]:
                 e["part"] = o["blsync_part"]
             elif not moved:
