@@ -28,6 +28,8 @@
 | 路径 | 内容 |
 |---|---|
 | `blender/renou_blsync_lib.py` | **R1 函数库**（唯一一份）：载入批、按楼分组、挪、绕楼中心转、换件、复制、删除、单件导出、发布并等回执、写回、本机经 ssh 推送 |
+| `blender/renou_blsync/` | **Blender 插件（LS01）**：实时开关（对应 D5 的开始/暂停）、变化监听、侧栏面板 View3D > N > Renou。底座就是上面的函数库 |
+| `tools/build_addon.py` | 打出可安装的插件 zip（把函数库一起打进去） |
 | `ue/Content/Python/` | UE 侧接收器：`bl_sync_core.py`、`bl_sync.py`、`bl_setup_level.py`。依赖视效工程里的 `lk_session.py` 请求通道（不在本仓库） |
 | `tools/req.py` | 向 UE 请求通道发命令的小工具 |
 | `tests/` | 不需要 UE 的自测：`make_fixture.py` 生成合成数据（纯方盒，不含任何团队素材），`mock_ue_receiver.py` 是假的 UE 接收器，`test_lib_mock.py` 跑一遍完整流程 |
@@ -41,14 +43,25 @@
 
 ```bash
 blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.py -- build
+blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock.py -- build
 ```
 
-最后一行是 `RESULT OK` 就算通过，退出码 0。当前 18 项全部通过。
+两套最后一行都是 `RESULT OK` 就算通过，退出码 0。当前函数库 18 项、插件 20 项全部通过。GitHub Actions 每个 PR 也会自动跑。
+
+## 装插件
+
+```bash
+python3 tools/build_addon.py
+```
+
+生成 `build/renou_blsync-<版本>.zip`，在 Blender 里用“编辑 > 偏好设置 > 插件 > 从磁盘安装”装上。侧栏 Renou 面板依次填摆放表、零件包、覆盖文件，点“载入批”，再打开“实时同步”。
+
+架构和以后的扩展方向见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 现在在做什么
 
 - [x] 第 1 步：楼的摆放、换件、改单件形状（R1–R4、R7）
-- [ ] LS01：Blender 插件（实时开关、变化监听、面板），底座是 R1 函数库，见 `docs/SPEC_v2_Blender侧.md`
+- [x] LS01 框架初稿：Blender 插件（实时开关、变化监听、面板），底座是 R1 函数库，见 `docs/SPEC_v2_Blender侧.md`
 - [ ] 第 2 步：新的独立大件直接进 UE（永久 id、材质槽契约、未映射槽用醒目占位）
 - [ ] 第 3 步：地形、道路、地面按块同步；UE 只在受影响的格子里重跑 PCG
 
