@@ -916,9 +916,44 @@ def resume():
     return {"resumed": True, "watching": (S.get("watch") or {}).get("paths")}
 
 
-def attach(req):
+SESSION = CTRL / "session.json"
+
+
+def _session():
+    try:
+        return json.loads(SESSION.read_text(encoding="utf-8"))
+    except Exception:
+        return {"attach": [], "watch": None}
+
+
+def _save_session(sess):
+    SESSION.with_suffix(".tmp").write_text(json.dumps(sess, ensure_ascii=False, indent=1), encoding="utf-8")
+    SESSION.with_suffix(".tmp").replace(SESSION)
+
+
+def restore():
+    """after an editor restart: attach every batch of the session file again and watch its files (the override files
+    are cumulative, so the preview comes back as it was). Batches that fail are reported and kept in the file."""
+    sess, out = _session(), {"attached": {}, "failed": {}}
+    for req in sess.get("attach", []):
+        try:
+            out["attached"][req.get("name") or req.get("placements")] = attach(req, remember=False)
+        except Exception as exc:
+            out["failed"][req.get("name") or req.get("placements")] = str(exc)[:300]
+    w = sess.get("watch")
+    if w and w.get("paths"):
+        out["watch"] = watch(w["paths"], w.get("interval", 0.2), remember=False)
+    return out
+
+
+def attach(req, remember=True):
     kinds = {"veg": VegBatch, "ground": GroundBatch}
     b = kinds.get(req.get("kind"), Batch)(req)
+    if remember:
+        sess = _session()
+        keep = {k: v for k, v in req.items() if k not in ("id", "script", "action")}
+        sess["attach"] = [r for r in sess.get("attach", []) if (r.get("name") or r.get("placements")) != b.name] + [keep]
+        _save_session(sess)
     S["batches"][b.name] = b
     log(f"attached {b.name}: {b.report}")
     return b.report
@@ -965,14 +1000,22 @@ def _watch_tick(dt):
             (CTRL / "status.json").write_text(json.dumps({"error": err, "file": path, "t": time.time()}), encoding="utf-8")
 
 
-def watch(paths, interval=0.2):
-    unwatch()
+def watch(paths, interval=0.2, remember=True):
+    unwatch(remember=False)
+    if remember:
+        sess = _session()
+        sess["watch"] = {"paths": [str(p) for p in paths], "interval": float(interval)}
+        _save_session(sess)
     S["watch"] = {"paths": [str(p) for p in paths], "sig": {}, "next": 0.0, "interval": float(interval)}
     S["watch"]["handle"] = unreal.register_slate_post_tick_callback(_watch_tick)
     return {"watching": S["watch"]["paths"], "interval": interval}
 
 
-def unwatch():
+def unwatch(remember=True):
+    if remember:
+        sess = _session()
+        sess["watch"] = None
+        _save_session(sess)
     w = S.get("watch")
     if w and w.get("handle"):
         unreal.unregister_slate_post_tick_callback(w["handle"])
@@ -987,13 +1030,23 @@ def reset(name):
 
 
 def detach(name=None):
-    """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch."""
-    unwatch()
+    """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch
+    (also in the session file: a later restore will not bring it back)."""
+    sess = _session()
+    sess["attach"] = [r for r in sess.get("attach", []) if name and (r.get("name") or r.get("placements")) != name]
+    if not name:
+        sess["watch"] = None
+    _save_session(sess)
+    if not name:
+        unwatch(remember=False)                   # one batch: the others keep being watched
     out = {}
     for n in ([name] if name else list(S["batches"])):
         if n in S["batches"]:
             out[n] = reset(n)
             del S["batches"][n]
+    if name:
+        out["save_guard"] = reguard()             # only what the remaining batches still need
+        return out
     left = _guard_state()
     guard(list(left), False)                      # also files guarded by an earlier editor session
     S["suspended"] = False
@@ -1072,3 +1125,96 @@ def where(name, iid):
     c = t.transform_location(comp.get_editor_property("static_mesh").get_bounds().origin)
     return {"centre_m": [round(c.x / 100, 3), round(-c.y / 100, 3), round(c.z / 100, 3)],
             "yaw_ue": round(t.rotation.rotator().yaw, 3), "scale": [round(v, 4) for v in (t.scale3d.x, t.scale3d.y, t.scale3d.z)]}
+
+
+# ---------------------------------------------------------------- control channel (own file, not 视效's lk_session)
+ACTIONS = ("attach", "apply", "watch", "unwatch", "reset", "detach", "status", "restore", "suspend", "resume", "remap",
+           "where", "materials", "fingerprint")
+
+
+def dispatch(req):
+    """one request (the same JSON bl_sync.py takes) -> report. Used by bl_sync.py and by the control channel."""
+    act = req.get("action", "status")
+    if act == "attach":
+        return attach(req)
+    if act == "apply":
+        return apply_file(req["overrides"], req.get("name"))
+    if act == "watch":
+        p = req["overrides"]
+        return watch(p if isinstance(p, list) else [p], req.get("interval", 0.2))
+    if act == "unwatch":
+        return unwatch()
+    if act == "reset":
+        return reset(req["name"])
+    if act == "detach":
+        return detach(req.get("name"))
+    if act == "restore":
+        return restore()
+    if act == "suspend":
+        return suspend()
+    if act == "resume":
+        return resume()
+    if act == "remap":
+        return remap(req.get("name"))
+    if act == "where":
+        return where(req["name"], req["inst"])
+    if act == "materials":
+        return materials(req["name"], req["inst"])
+    if act == "fingerprint":
+        return fingerprint()
+    return {"batches": {k: {"rev": b.rev, "overrides": len(b.applied), "instances": len(b.base)}
+                        for k, b in S["batches"].items()},
+            "watch": (S["watch"] or {}).get("paths"), "suspended": bool(S.get("suspended")), "session": _session()}
+
+
+CREQ, CRES = CTRL / "request.json", CTRL / "result.json"
+_CTL = {"sig": None, "last": None, "next": 0.0}
+
+
+def _ctl_tick(dt):
+    """Saved/BlSync/request.json -> result.json, 4 times a second, independent of 视效's channel."""
+    if time.monotonic() < _CTL["next"]:
+        return
+    _CTL["next"] = time.monotonic() + 0.25
+    try:
+        st = os.stat(CREQ)
+    except FileNotFoundError:
+        return
+    sig = (st.st_mtime_ns, st.st_size)
+    if sig == _CTL["sig"]:
+        return
+    _CTL["sig"] = sig
+    try:
+        req = json.loads(CREQ.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return
+    if not req.get("id") or req.get("id") == _CTL["last"]:
+        return
+    _CTL["last"] = req["id"]
+    t0 = time.time()
+    try:
+        res = {"id": req["id"], "status": "done", "action": req.get("action"), "report": dispatch(req)}
+    except Exception:
+        res = {"id": req["id"], "status": "error", "action": req.get("action"), "error": traceback.format_exc()[-2000:]}
+    res["seconds"] = round(time.time() - t0, 3)
+    CRES.with_suffix(".tmp").write_text(json.dumps(res, ensure_ascii=False, default=str), encoding="utf-8")
+    CRES.with_suffix(".tmp").replace(CRES)
+
+
+def _start_ctl():
+    import builtins
+    old = getattr(builtins, "_blsync_ctl_handle", None)   # a reloaded module must not leave the old tick running
+    if old is not None:
+        try:
+            unreal.unregister_slate_post_tick_callback(old)
+        except Exception:
+            pass
+    try:                                                  # a request left from an earlier editor session is not run
+        _CTL["last"] = json.loads(CREQ.read_text(encoding="utf-8-sig")).get("id")
+        _CTL["sig"] = (os.stat(CREQ).st_mtime_ns, os.stat(CREQ).st_size)
+    except Exception:
+        pass
+    builtins._blsync_ctl_handle = unreal.register_slate_post_tick_callback(_ctl_tick)
+
+
+_start_ctl()

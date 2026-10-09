@@ -10,6 +10,9 @@ REQUEST {"action": "attach", "placements": "/abs/<batch>_placements.json", "name
         {"action": "suspend"} / {"action": "resume"}   (UE save: previews back to the tables, then re-applied)
         {"action": "remap", "name": optional}   (slots showing the placeholder get their material again from table / rules)
         {"action": "fingerprint"}   (R2: lights, sky, fog, post, foliage, cameras and untouched materials, as one hash)
+        {"action": "restore"}   (after an editor restart: attach + watch again from Saved/BlSync/session.json)
+        Every core action can also be sent through bl_sync's own channel Saved/BlSync/request.json -> result.json
+        (tools/bs_req.py), so 视效's lk_session channel is needed only once after a restart (restore).
         {"action": "reload"}   (re-import bl_sync_core after an update: drops the state, attach + watch again)
         {"action": "frame", "inst": "<instance id>", "cam": "BLSYNC", "dist": 1.6}   (CineCamera CAM_<cam> looking at it)
         {"action": "frame", "cam": "BLSYNC", "remove": true}   (delete that temporary camera again)
@@ -20,7 +23,9 @@ import bl_sync_core as core
 
 REQ = globals().get("REQUEST", {}) or {}
 act = REQ.get("action", "status")
-if act == "reload":
+if act in core.ACTIONS:                               # the same code the control channel runs
+    REPORT = core.dispatch(REQ)
+elif act == "reload":
     core.detach()
     REPORT = {"reloaded": importlib.reload(core).__file__}
 elif act == "attach":
