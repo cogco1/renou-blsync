@@ -8,6 +8,7 @@ REQUEST {"action": "attach", "placements": "/abs/<batch>_placements.json", "name
         {"action": "materials", "name": "<name>", "inst": ["<id>", ...]}   (mesh and per-slot material of instances)
         {"action": "attach", "kind": "veg", "placements": "/abs/veg_..._placements.json", "veg": "S02"}   (vegetation, #12)
         {"action": "suspend"} / {"action": "resume"}   (UE save: previews back to the tables, then re-applied)
+        {"action": "remap", "name": optional}   (slots showing the placeholder get their material again from table / rules)
         {"action": "fingerprint"}   (R2: lights, sky, fog, post, foliage, cameras and untouched materials, as one hash)
         {"action": "reload"}   (re-import bl_sync_core after an update: drops the state, attach + watch again)
         {"action": "frame", "inst": "<instance id>", "cam": "BLSYNC", "dist": 1.6}   (CineCamera CAM_<cam> looking at it)
@@ -33,6 +34,8 @@ elif act == "unwatch":
     REPORT = core.unwatch()
 elif act == "reset":
     REPORT = core.reset(REQ["name"])
+elif act == "remap":                                 # after 视效 extends the slot table / rules: re-resolve placeholders
+    REPORT = core.remap(REQ.get("name"))
 elif act == "suspend":                               # before UE saves a level that holds previewed actors
     REPORT = core.suspend()
 elif act == "resume":

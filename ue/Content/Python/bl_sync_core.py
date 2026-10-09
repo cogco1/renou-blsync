@@ -52,6 +52,20 @@ def _stem(k):                                      # = ct_placements.stem
     return re.sub(r"[._]?\d{1,3}$", "", k)
 
 
+def read_rules(f):
+    """ct_unmapped.py's RULES list ([regex, MI name], ...) read with ast - the script itself is not run (it would scan
+    the open level). 视效's make_slot_mi_table.py reads it the same way."""
+    import ast
+    tree = ast.parse(Path(f).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "RULES" for t in node.targets):
+            v = node.value
+            if isinstance(v, ast.BoolOp):                    # RULES = REQ.get("rules") or [ ... ]
+                v = v.values[-1]
+            return [tuple(x) for x in ast.literal_eval(v)]
+    return []
+
+
 def mi_for_slot(slot):
     """the tuned MI_C_* ct_placements would give this slot name (same maps and ct_unmapped rules), or None."""
     if "mm" not in _MI:
@@ -65,10 +79,8 @@ def mi_for_slot(slot):
         st = {}
         for key in sorted(mm):
             st.setdefault(_stem(key), mm[key])
-        rules = []
         f = Path(unreal.Paths.project_content_dir()) / "Python" / "ct_unmapped.py"
-        if mm and f.exists():
-            rules = runpy.run_path(str(f), init_globals={"REQUEST": {"apply": False, "dry": True}})["RULES"]
+        rules = read_rules(f) if mm and f.exists() else []
         _MI.update(mm=mm, st=st, rules=rules)
     k = _norm(slot)
     p = _MI["mm"].get(k) or _MI["mm"].get(k[:52]) or _MI["st"].get(_stem(k)) or _MI["st"].get(_stem(k[:52]))
@@ -219,6 +231,7 @@ class Batch:
         self.dest = req.get("dest", f"/Game/Inst/{self.name}")
         self.prefer = req.get("prefer", ["NEAR", "MID", "FAR"])
         self.slot_table_path, self.slot_table, self.slot_table_norm = load_slot_table(req.get("slot_table"))
+        _MI.clear()                                 # MI_C_ list and ct_unmapped RULES are read again
         self.unmapped = set()                       # slots that got the placeholder (receipt: 视效 adds a table row)
         self.meshes = {}
         for p in EAL.list_assets(f"{self.dest}/parts", recursive=True, include_folder=False):
@@ -291,11 +304,12 @@ class Batch:
            "keep_if_textured" (the generic Material_0 / Material_0.00N names: every Meshy model has its own) keep the
            import's material when the incoming GLB material has a texture ("keep_textured"); every other entry wins
            even over a texture (F5_*, C__Harbor_*: the formal import maps them to MI_C_ too);
-        2. slot not in the table: a generic name (GENERIC_SLOT: Material, Material_0, Material_0.001 ...) with a texture keeps its own material,
-           the same rule ct_placements uses since 10-09 ("keep_textured"); otherwise the material UE already shows
-           for this slot name in the batch ("ue");
-        3. otherwise a loud placeholder, listed in the receipt ("placeholder"). No table at all: ct_placements' rules
-           ("rule") or the import's material."""
+        2. slot not in the table: a generic name (GENERIC_SLOT: Material, Material_0, Material_0.001 ...) with a texture
+           keeps its own material, the same rule ct_placements uses since 10-09 ("keep_textured"); otherwise the formal
+           import's own mi_path - MI_C_<norm> (cut to 52), then without the trailing number, then ct_unmapped's RULES
+           ("rule", 视效 10-09: most new names map this way, exactly as the formal rebuild); then the material UE already
+           shows for this slot name in the batch ("ue");
+        3. otherwise a loud placeholder, listed in the receipt ("placeholder")."""
         if not hasattr(self, "_slotmat"):
             self._slotmat = {}
             for c in self.comps.values():
@@ -315,14 +329,16 @@ class Batch:
                 return unreal.load_asset(p), "table"
         if textured and GENERIC_SLOT.match(slot.lower()):
             return None, "keep_textured"
+        m = mi_for_slot(slot)
+        if m is not None:
+            return m, "rule"
         m = self._slotmat.get(k)
         if m is not None:
             return m, "ue"
         if self.slot_table_path:
             self.unmapped.add(slot)
             return unreal.load_asset(PLACEHOLDER), "placeholder"
-        m = mi_for_slot(slot)
-        return (m, "rule") if m is not None else (None, "keep")
+        return None, "keep"
 
     def needs_glb_materials(self, names, old_mesh):
         """True when some slot of the new mesh would end on "keep" (KEEP_GLB) with nothing in UE to show for it."""
@@ -843,6 +859,38 @@ class GroundBatch(Batch):
             self.carry_materials(comp, comp.get_editor_property("static_mesh"), orig)
             del self.mesh_sha[tid]
             out.setdefault("meshes_reverted", []).append(tid)
+
+
+def remap(name=None):
+    """视效 extended the slot table or the rules: every slot that shows the placeholder is resolved again (table, then
+    the formal mi_path, then UE's material by name). Nothing else changes; no import, no flicker."""
+    out = {}
+    ph = PLACEHOLDER.split(".")[0]
+    for n, b in S["batches"].items():
+        if name and n != name:
+            continue
+        b.slot_table_path, b.slot_table, b.slot_table_norm = load_slot_table()
+        _MI.clear()
+        b.unmapped = set()
+        comps = list(b.comps.values()) + [c for _a, c, _m in getattr(b, "tiles", {}).values()]
+        fixed = 0
+        for c in comps:
+            mesh = c.get_editor_property("static_mesh")
+            if mesh is None:
+                continue
+            b.textured_now = getattr(b, "textured_by_mesh", {}).get(mesh.get_path_name(), set())
+            for j, slot in enumerate(slot_names(mesh)):
+                cur = c.get_material(j)
+                if cur is None or cur.get_path_name().split(".")[0] != ph:
+                    continue
+                m, how = b.ue_material(slot)
+                if m is None and how in ("keep", "keep_textured"):
+                    m = mesh.get_material(j)
+                if m is not None and m.get_path_name().split(".")[0] != ph:
+                    c.set_material(j, m)
+                    fixed += 1
+        out[n] = {"slots_fixed": fixed, "still_unmapped": sorted(b.unmapped), "slot_table": b.slot_table_path}
+    return out
 
 
 def suspend():
