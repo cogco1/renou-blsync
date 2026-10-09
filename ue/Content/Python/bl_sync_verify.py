@@ -1,7 +1,7 @@
 """Blender→UE 实时预览, read only: does every attached batch show exactly what its override file says?
 For each instance of the last applied override (and every untouched table row of the batch): UE's instance transform
-against the expected state (bl_sync_core.xf_err, cm). REQUEST {"name": "<batch>" (optional), "all": false}:
-all=true also checks the untouched table rows. REPORT {batch: {"rev", "checked", "worst_cm", "bad": [...]}}."""
+against the expected state (bl_sync_core.xf_err, cm). REQUEST {"name": "<batch>" (optional), "all": false, "full": false}:
+all=true also checks the untouched table rows; full=true lists every mismatching id. REPORT {batch: {"rev", "checked", "worst_cm", "bad": [...]}}."""
 import bl_sync_core as core
 
 REPORT = {}
@@ -22,6 +22,18 @@ for n, b in core.S["batches"].items():
         e = core.xf_err(b.comps[slot[0]].get_instance_transform(slot[1], True), st)
         worst, checked = max(worst, e), checked + 1
         if e > 1.0:
-            bad.append([iid, round(e, 2)])
-    REPORT[n] = {"rev": b.rev, "checked": checked, "hidden": hidden, "worst_cm": round(worst, 4), "bad": bad[:20],
+            bad.append([iid, round(e, 2), "override" if iid in b.applied else "table", slot[0][1].rsplit("/", 1)[-1], slot[1]])
+    # a hidden-by-override instance must really be hidden (scale ~1e-4 at its slot)
+    shown = []
+    for iid, st in b.applied.items():
+        slot = b.slot.get(iid)
+        if st["deleted"] and slot:
+            t = b.comps[slot[0]].get_instance_transform(slot[1], True)
+            if max(abs(t.scale3d.x), abs(t.scale3d.y), abs(t.scale3d.z)) > 0.01:
+                shown.append(iid)
+    REPORT[n] = {"rev": b.rev, "checked": checked, "hidden": hidden, "worst_cm": round(worst, 4),
+                 "bad_count": len(bad), "bad_override": [x for x in bad if x[2] == "override"][:50],
+                 "bad_table_sample": [x for x in bad if x[2] == "table"][:5], "deleted_but_shown": shown,
                  "pending_meshes": sorted(getattr(b, "pending", {}) or {})}
+    if REQUEST.get("full"):
+        REPORT[n]["bad_ids"] = [x[0] for x in bad]
