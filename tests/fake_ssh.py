@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Local-only ssh/scp stand-ins for remote-mode tests; never invoke a shell or network.
 
 The synthetic host maps directly to absolute paths inside remote_dir. Keeping the

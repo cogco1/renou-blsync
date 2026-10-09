@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """The LS01 add-on (blender/renou_blsync) against the mock UE receiver: no UE, no team assets.
     blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock.py -- build
 Background Blender has no event loop, so the test calls the timer callback (live.tick) itself; everything else - the

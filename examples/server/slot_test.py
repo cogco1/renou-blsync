@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 import json, sys
 sys.path.insert(0, "/workspace/jobs/look-blsync-20261009-01/lib")
 import bpy

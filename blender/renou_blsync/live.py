@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """The live switch (D5 LiveSync's start/stop): changes made by scripts or by hand are published automatically.
 
 - depsgraph handler: only marks batches dirty (cheap, runs on every update)

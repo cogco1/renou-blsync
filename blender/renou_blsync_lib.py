@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 2026-10-09: small Blender library for scripted edits that show up live in UE (until the
 interactive add-on exists). Use inside Blender 5.2 (headless or on the Selkies desktop):
 

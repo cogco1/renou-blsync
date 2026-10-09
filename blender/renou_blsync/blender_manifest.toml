@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+schema_version = "1.0.0"
+id = "renou_blsync"
+version = "0.1.0"
+name = "Renou Sync (Blender → UE live)"
+tagline = "Sync placement and meshes from Blender to UE"
+maintainer = "人偶之心"
+type = "add-on"
+website = "https://github.com/cogco1/renou-blsync"
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Read placements and parts and write exports and sync receipts"
+network = "Send sync files to the configured UE host using system SSH"

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Sidebar panel: View3D > N > Renou."""
 import time
 

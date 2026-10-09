@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender→UE 实时预览 test only (R3): an L_S02-like structure (persistent level + the batch as a streamed sublevel),
 a VFX-style edit + save while the preview is on, and the file times / modes of both levels.
 REQUEST {"make_host": true} | {"vfx_save": 7.5}  (sun intensity to set on R3_Sun, then save_dirty_packages)"""

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · LS01 test helper: a stand-in for the UE receiver (bl_sync_core) so the Blender plugin can be tested without
 UE. Watches one override file, checks the renou-overrides/1 format against the base placements table, and writes the
 same status.json UE writes ({"rev", "written", "counts", "overrides", "seconds", "applied_at", "latency_s", "errors"}).

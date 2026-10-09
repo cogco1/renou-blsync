@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Session state of the add-on (module globals: Batch objects cannot live in .blend data). Lost on reload, by design:
 re-attach after opening a file."""
 import bpy

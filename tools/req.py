@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 test copy: send one lk_session request to the test editor and wait (视效's live_req.py
 with the test project path).   python3 req.py <script.py> '<json>' [timeout_s]      python3 req.py quit"""
 import json, os, sys, time, uuid

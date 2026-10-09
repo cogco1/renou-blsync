@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender→UE 实时预览: engineering-style scripted test of renou_blsync_lib against the UE test editor (headless)."""
 import json, sys, time
 sys.path.insert(0, "/workspace/jobs/look-blsync-20261009-01/lib")

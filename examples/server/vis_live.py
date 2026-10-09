@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 2026-10-09: acceptance in 视效's live editor (L_S02, present era, P1): move one CBD block,
 swap one, re-import one part's mesh, reset - a P1 still and the material paths of the touched instances after each step.
   blender -b --factory-startup --python vis_live.py

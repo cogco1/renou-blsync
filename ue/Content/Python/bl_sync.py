@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 2026-10-09: lk_session entry for bl_sync_core (state lives in the imported module).
 REQUEST {"action": "attach", "placements": "/abs/<batch>_placements.json", "name": "<ct_placements name>", "dest": optional}
         {"action": "apply", "overrides": "/abs/<batch>_overrides.json"}
