@@ -46,7 +46,7 @@ blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.p
 blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock.py -- build
 ```
 
-两套最后一行都是 `RESULT OK` 就算通过，退出码 0。当前函数库 53 项、插件 19 项全部通过。GitHub Actions 每个 PR 也会自动跑。
+两套最后一行都是 `RESULT OK` 就算通过，退出码 0。当前函数库 56 项、插件 19 项全部通过。GitHub Actions 每个 PR 也会自动跑。
 
 函数库测试包括远程模式：`tests/fake_ssh.py` 把假 `ssh` / `scp` 放到 PATH 最前面，只在临时本地目录里模拟推送和回执，不连接服务器、不读取 ssh 配置。覆盖 GLB 去重、网格变化后重推、原子写入、回执读取和超时；测试结束恢复 PATH 并清理临时目录。
 

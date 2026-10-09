@@ -58,7 +58,7 @@
 
 ## 测试
 
-- `tests/test_lib_mock.py`（53 项）：函数库完整流程、新物体/材质槽名导出、父变换与三轴缩放回读；通过 `tests/fake_ssh.py` 在本地模拟远程推送，检查 GLB 去重、变化后重推、原子写入和回执，不连接真实服务器。
+- `tests/test_lib_mock.py`（56 项）：函数库完整流程、新物体/材质槽名导出（含无槽、空槽和派生件）、父变换与三轴缩放回读；通过 `tests/fake_ssh.py` 在本地模拟远程推送，检查 GLB 去重、变化后重推、原子写入和回执，不连接真实服务器。
 - `tests/test_addon_mock.py`（19 项）：插件的实时开关、监听、Shift+D、手动删除、网格签名、定稿、暂停、还原、卸载。
 - 都用 `tests/make_fixture.py` 生成的合成方盒，加上 `tests/mock_ue_receiver.py` 这个假 UE；GitHub Actions 每个 PR 自动跑。
 - UE 侧没法在 CI 里跑，由服务器上的 Claude 会话用 `tests/ue_probes/` 实测。

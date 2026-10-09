@@ -233,6 +233,29 @@ try:
           and receipt_ok(r) and r["ue"]["counts"].get("added") == 1 and not gltf.get("materials"))
     B.reset()
     B.publish("reset default addition", wait=10)
+    temporary_slot = bpy.data.materials.new("synthetic empty slot")
+    bare.data.materials.append(temporary_slot)
+    bare.data.materials[0] = None
+    bpy.data.materials.remove(temporary_slot)
+    for polygon in bare.data.polygons:
+        polygon.material_index = 0
+    empty_part, derived_part = "P000000000005", "P000000000006"
+    empty_added = B.add_object(bare, empty_part)
+    raw = Path(B.mesh_out[empty_part]["glb"]).read_bytes()
+    gltf = json.loads(raw[20:20 + struct.unpack_from("<I", raw, 12)[0]])
+    check("add_object: an existing None material slot exports as an empty name",
+          gltf.get("materials") == [{"name": ""}] and not gltf.get("images") and not gltf.get("textures"))
+    check("add_object: an empty source material slot stays None",
+          len(bare.data.materials) == 1 and bare.data.materials[0] is None and empty_added.data.materials[0] is None)
+    B.new_part(empty_part, derived_part)
+    derived = B.export_part(derived_part)
+    raw = Path(derived["glb"]).read_bytes()
+    gltf = json.loads(raw[20:20 + struct.unpack_from("<I", raw, 12)[0]])
+    check("add_object: new_part derivatives inherit slot-only export",
+          gltf.get("materials") == [{"name": ""}] and gltf["meshes"][0]["name"] == derived_part
+          and not gltf.get("images") and not gltf.get("textures"))
+    B.reset()
+    B.publish("reset empty-slot addition", wait=10)
 
     # Remote mode uses the real subprocess-based transport, but PATH can only
     # reach these local stand-ins. All data is synthetic; no server is involved.
