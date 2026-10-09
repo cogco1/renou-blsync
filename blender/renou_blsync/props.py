@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Scene settings (saved in the .blend). No passwords or keys: the server is reached with the system's own ssh/scp."""
 import bpy
 from bpy.props import BoolProperty, FloatProperty, PointerProperty, StringProperty

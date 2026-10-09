@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 2026-10-09: Blender side of the closed-loop test (headless reference implementation of
 the override writer; the interactive add-on is specified in SPEC_Blender侧插件.md).
   blender -b --factory-startup --python bl_live_test.py -- --placements P.json --out O_overrides.json --status S.json

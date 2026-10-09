@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 test copy 2026-10-09: make the test level (new, empty) with sun, sky, fog.
 REQUEST {"map": "/Game/BlSync/L_Test"}. Then ct_placements builds the batch into it (its "map" = the same path)."""
 import unreal

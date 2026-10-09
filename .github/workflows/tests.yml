@@ -36,6 +36,12 @@ jobs:
         run: ~/blender/blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock.py -- build
       - name: Build add-on zip
         run: python3 tools/build_addon.py
+      - name: Check extension packaging
+        run: python3 tests/test_extension_package.py
+      - name: Validate Blender extension archive
+        run: ~/blender/blender --command extension validate "$(ls build/renou_blsync-*.zip)"
+      - name: Smoke-test packaged extension
+        run: ~/blender/blender -b --factory-startup --python-exit-code 1 --python tests/test_extension_import.py
       - uses: actions/upload-artifact@v4
         with:
           name: renou_blsync-addon

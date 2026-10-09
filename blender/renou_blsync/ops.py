@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Operators. All real work is done by renou_blsync_lib (state.rb); these only wire it to the panel and the live switch."""
 import bpy
 

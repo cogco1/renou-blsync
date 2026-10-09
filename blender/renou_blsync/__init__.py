@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """renou_blsync: Blender → UE live sync for 人偶之心 (LS01).
 
 The add-on is a thin shell: a live switch, a change listener and a panel. Everything else - loading a batch, computing

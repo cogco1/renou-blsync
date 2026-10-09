@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 2026-10-09: "改了的网格单独重导" test, Blender side (headless).
   blender -b --factory-startup --python bl_mesh_test.py -- --parts P_parts.glb --placements P.json --part <part>
         --scale-z 1.3 --meshdir <dir> --out O_overrides.json --status S.json

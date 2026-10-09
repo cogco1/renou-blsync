@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """renou_blsync_lib against the mock UE receiver: no UE, no team assets.
     blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.py -- build
 Builds the synthetic fixture (tests/make_fixture.py), starts tests/mock_ue_receiver.py with Blender's own Python, then

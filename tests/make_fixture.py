@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Synthetic test data for renou_blsync: no team assets, plain boxes only.
     python3 tests/make_fixture.py build/fixture
 Writes batch "test_01":

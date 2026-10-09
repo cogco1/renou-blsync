@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """人偶之心 · Blender→UE 实时预览 2026-10-09 (user: "脚本Blender做没问题，但需要在UE预览效果，这样快速迭代").
 UE side of the live link. Works on a batch that ct_placements.py already built (one HISM per part per era on the actors
 INST_<name>_<era>) and changes it in place: no re-import, no re-build, no level save. Imported once, kept in sys.modules,

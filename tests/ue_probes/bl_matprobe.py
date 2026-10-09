@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Blender→UE 实时预览 test only: simulate UE-owned materials and read them back.
 REQUEST {"paint": "/Engine/BasicShapes/BasicShapeMaterial"} -> every HISM slot of every attached batch gets that override
         {"inst": ["id", ...]} -> per instance: mesh, per-slot material path"""

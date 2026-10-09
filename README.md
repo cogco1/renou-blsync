@@ -56,7 +56,7 @@ blender -b --factory-startup --python-exit-code 1 --python tests/test_addon_mock
 python3 tools/build_addon.py
 ```
 
-生成 `build/renou_blsync-<版本>.zip`，在 Blender 里用“编辑 > 偏好设置 > 插件 > 从磁盘安装”装上。侧栏 Renou 面板依次填摆放表、零件包、覆盖文件，点“载入批”，再打开“实时同步”。
+生成 Blender 5 扩展格式的 `build/renou_blsync-<版本>.zip`（清单和入口位于 ZIP 根目录，最低 Blender 版本与 `bl_info` 一致），在 Blender 里用“编辑 > 偏好设置 > 插件 > 从磁盘安装”装上。侧栏 Renou 面板依次填摆放表、零件包、覆盖文件，点“载入批”，再打开“实时同步”。
 
 架构和以后的扩展方向见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
@@ -83,4 +83,9 @@ receipt = B.publish("add independent asset")
 
 一起改代码的规矩见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-本仓库只有代码和文档。游戏素材、摆放数据和服务器配置都不在这里，也不要提交进来。没有附开源许可证。
+本仓库只有代码和文档。游戏素材、摆放数据和服务器配置都不在这里，也不要提交进来。
+
+## 许可证
+
+本仓库代码采用 **GPL-3.0-or-later**：GNU GPL 第 3 版，或由你选择的任何后续版本。全文见 [LICENSE](LICENSE)。
+构建的扩展 ZIP 同时包含 LICENSE 和 SPDX 许可证声明。此许可证不授权本仓库未包含的游戏素材、第三方资产或服务。
