@@ -1067,12 +1067,16 @@ def _save_session(sess):
 def restore():
     """after an editor restart: attach every batch of the session file again and watch its files (the override files
     are cumulative, so the preview comes back as it was). Batches that fail are reported and kept in the file."""
-    sess, out = _session(), {"attached": {}, "failed": {}}
+    sess, out = _session(), {"attached": {}, "failed": {}, "already": []}
     for req in sess.get("attach", []):
+        key = req.get("name") or req.get("placements")
+        if key in S["batches"]:                 # restore twice (视效's start script + a manual one): keep what runs
+            out["already"].append(key)
+            continue
         try:
-            out["attached"][req.get("name") or req.get("placements")] = attach(req, remember=False)
+            out["attached"][key] = attach(req, remember=False)
         except Exception as exc:
-            out["failed"][req.get("name") or req.get("placements")] = str(exc)[:300]
+            out["failed"][key] = str(exc)[:300]
     w = sess.get("watch")
     if w and w.get("paths"):
         out["watch"] = watch(w["paths"], w.get("interval", 0.2), remember=False)
@@ -1080,8 +1084,16 @@ def restore():
 
 
 def attach(req, remember=True):
+    """a batch that is attached already is reset first and replaced: a second Batch object over a layer the first one
+    changed would take the preview's added instances for table rows (and never trim them)."""
     kinds = {"veg": VegBatch, "ground": GroundBatch}
+    again = req.get("name") in S["batches"]
+    if again:
+        reset(req["name"])
+        del S["batches"][req["name"]]
     b = kinds.get(req.get("kind"), Batch)(req)
+    if again and S.get("watch"):
+        S["watch"]["sig"] = {}                      # the watched files are applied again to the new object
     if remember:
         sess = _session()
         keep = {k: v for k, v in req.items() if k not in ("id", "script", "action")}
