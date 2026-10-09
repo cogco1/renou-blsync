@@ -33,6 +33,39 @@ elif act == "reset":
     REPORT = core.reset(REQ["name"])
 elif act == "detach":
     REPORT = core.detach(REQ.get("name"))
+elif act == "import_probe":                          # issue #11: time one import into /Game/_LivePreview/_probe, change nothing
+    import time
+    t = time.time()
+    folder = f"{core.LIVE_ROOT}/_probe/{REQ.get('tag', 'p')}_{int(t)}"
+    # self-contained (runpy reloads this file on every request; the cached core module stays as it is)
+    mgr = unreal.InterchangeManager.get_interchange_manager_scripted()
+    params = unreal.ImportAssetParameters()
+    params.set_editor_property("is_automated", True)
+    params.set_editor_property("replace_existing", True)
+    pipe = unreal.SystemLibrary.duplicate_object(
+        unreal.load_object(None, "/Interchange/Pipelines/DefaultGLTFAssetsPipeline.DefaultGLTFAssetsPipeline"), mgr)
+    mp = pipe.get_editor_property("mesh_pipeline")
+    opts = [("build_nanite", True), ("generate_lightmap_u_vs", False), ("collision", not REQ.get("preview", True))]
+    if REQ.get("preview", True):
+        opts.append(("distance_field_resolution_scale", 0.0))
+    for k, v in opts:
+        mp.set_editor_property(k, v)
+    skipped = []
+    if not REQ.get("materials", True):                # issue #11: no GLB materials / textures (UE assigns its own per slot)
+        for sub, k in (("material_pipeline", "import_materials"), ("texture_pipeline", "import_textures")):
+            try:
+                pipe.get_editor_property(sub).set_editor_property(k, False)
+                skipped.append(f"{sub}.{k}")
+            except Exception as exc:
+                skipped.append(f"{sub}.{k}: {exc}")
+    params.set_editor_property("override_pipelines", [
+        unreal.SoftObjectPath(pipe.get_path_name()),
+        unreal.SoftObjectPath("/Interchange/Pipelines/DefaultGLTFPipeline.DefaultGLTFPipeline")])
+    ok = mgr.import_asset(folder, mgr.create_source_data(str(REQ["glb"])), params)
+    sms = unreal.EditorAssetLibrary.list_assets(folder, recursive=True, include_folder=False)
+    m = next((unreal.load_asset(x) for x in sms if isinstance(unreal.load_asset(x), unreal.StaticMesh)), None)
+    REPORT = {"ok": bool(ok), "seconds": round(time.time() - t, 2), "folder": folder, "preview": bool(REQ.get("preview", True)),
+              "skipped": skipped, "assets": len(sms), "slots": core.slot_names(m) if m else None}
 elif act == "fingerprint":
     REPORT = core.fingerprint()
 elif act == "materials":

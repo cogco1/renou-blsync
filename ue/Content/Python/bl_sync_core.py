@@ -154,8 +154,25 @@ def xf_err(t, st):
     return max(e, e2)
 
 
-def interchange_mesh(glb, folder):
-    """import one part GLB as plain Nanite static mesh(es) into folder, replacing assets of the same name in place."""
+def glb_material_names(glb):
+    """material names of a GLB, read from its JSON chunk only (= the slot names UE will give the mesh, before sanitising)."""
+    import struct
+    with open(glb, "rb") as fh:
+        magic, _v, _n = struct.unpack("<4sII", fh.read(12))
+        if magic != b"glTF":
+            return []
+        clen, _t = struct.unpack("<II", fh.read(8))
+        g = json.loads(fh.read(clen))
+    return [m.get("name", "") for m in g.get("materials", [])]
+
+
+def interchange_mesh(glb, folder, preview=True, materials=False):
+    """import one part GLB as plain Nanite static mesh(es) into folder, replacing assets of the same name in place.
+    preview (issue #11, 视效 agreed 10-09): no distance field and no collision - a preview mesh only shows position and
+    volume; Lumen soft shadows / GI on it are a little worse until the formal ct_placements rebuild.
+    materials=False (issue #11): the GLB's own materials are not imported - making their instances and compiling their
+    shaders was 15 of the 17 s in the live editor (0.1 s without); UE gives every slot its own material anyway. Only
+    needed when a slot must keep the GLB material (KEEP_GLB) and UE has no material for that slot name yet."""
     mgr = unreal.InterchangeManager.get_interchange_manager_scripted()
     params = unreal.ImportAssetParameters()
     params.set_editor_property("is_automated", True)
@@ -163,11 +180,16 @@ def interchange_mesh(glb, folder):
     base = "DefaultGLTFAssetsPipeline"
     pipe = unreal.SystemLibrary.duplicate_object(unreal.load_object(None, f"/Interchange/Pipelines/{base}.{base}"), mgr)
     mp = pipe.get_editor_property("mesh_pipeline")
-    for k, v in (("build_nanite", True), ("generate_lightmap_u_vs", False), ("import_collision", False)):
+    opts = [("build_nanite", True), ("generate_lightmap_u_vs", False), ("collision", False)]
+    if preview:
+        opts.append(("distance_field_resolution_scale", 0.0))
+    for k, v in opts:
         try:
             mp.set_editor_property(k, v)
         except Exception:
-            pass
+            log(f"mesh pipeline has no property {k}")
+    if not materials:
+        pipe.get_editor_property("material_pipeline").set_editor_property("import_materials", False)
     params.set_editor_property("override_pipelines", [
         unreal.SoftObjectPath(pipe.get_path_name()),
         unreal.SoftObjectPath("/Interchange/Pipelines/DefaultGLTFPipeline.DefaultGLTFPipeline")])
@@ -280,6 +302,19 @@ class Batch:
         m = mi_for_slot(slot)
         return (m, "rule") if m is not None else (None, "keep")
 
+    def needs_glb_materials(self, names, old_mesh):
+        """True when some slot of the new mesh would end on "keep" (KEEP_GLB) with nothing in UE to show for it."""
+        old = {_norm(n) for n in slot_names(old_mesh)} if old_mesh else set()
+        for n in names:
+            k = _norm(n)
+            if k in old:
+                continue
+            m, how = self.ue_material(n)
+            if how == "keep":
+                return True
+        self.unmapped -= {n for n in names}         # ue_material() above only looked; the real assignment reports again
+        return False
+
     def carry_materials(self, comp, old_mesh, new_mesh):
         """switch comp to new_mesh; a slot with the same name as on the old mesh keeps exactly the material UE showed
         there ("carried"); other slots go through ue_material(). Returns {slot: [material or "glb", how]}."""
@@ -360,8 +395,9 @@ class Batch:
             found = []
             if EAL.does_directory_exist(folder):
                 found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
+            need_mats = self.needs_glb_materials(glb_material_names(glb), self.meshes.get(part.lower()))
             if not any(isinstance(a, unreal.StaticMesh) for a in found):
-                interchange_mesh(glb, folder)
+                interchange_mesh(glb, folder, materials=need_mats)
                 found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
             sms = [a for a in found if isinstance(a, unreal.StaticMesh)]
             new = next((a for a in sms if a.get_name().lower() == part.lower()), sms[0] if len(sms) == 1 else None)
@@ -385,6 +421,7 @@ class Batch:
             self.mesh_sha[part] = got
             tri = new.get_num_triangles(0) if hasattr(new, "get_num_triangles") else None
             out.setdefault("meshes", []).append({"part": part, "new_part": old is None, "hism_switched": swapped,
+                                                  "glb_materials": need_mats,
                                                   "slots": slots if old else None,
                                                   "asset": new.get_path_name(), "triangles": tri,
                                                   "seconds": round(time.time() - t, 2)})
