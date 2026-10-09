@@ -24,8 +24,12 @@ import bl_sync_core as core
 REQ = globals().get("REQUEST", {}) or {}
 act = REQ.get("action", "status")
 if act == "reload":                                   # first: the cached core may be older than this file
-    core.detach()
-    REPORT = {"reloaded": importlib.reload(core).__file__}
+    try:
+        core.detach(forget=False)                     # keep Saved/BlSync/session.json ...
+    except TypeError:
+        core.detach()                                 # (a core older than 10-09 23:00 cannot keep it)
+    core = importlib.reload(core)
+    REPORT = {"reloaded": core.__file__, "restore": core.restore()}   # ... and bring the session back at once
 elif act in getattr(core, "ACTIONS", ()):            # the same code the control channel runs
     REPORT = core.dispatch(REQ)
 elif act == "attach":

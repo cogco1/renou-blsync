@@ -977,20 +977,24 @@ def apply_file(path, name=None):
     return out
 
 
+def _sig(path):
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def _watch_tick(dt):
     w = S["watch"]
-    if not w or S.get("suspended") or time.monotonic() < w["next"]:
-        return
+    if not w or S.get("suspended") or S.get("busy") or time.monotonic() < w["next"]:
+        return                                   # never inside another apply / control request (imports pump ticks)
     w["next"] = time.monotonic() + w["interval"]
     for path in w["paths"]:
-        try:
-            st = os.stat(path)
-        except FileNotFoundError:
+        sig = _sig(path)
+        if sig is None or w["sig"].get(path) == sig:
             continue
-        sig = (st.st_mtime_ns, st.st_size)
-        if w["sig"].get(path) == sig:
-            continue
-        w["sig"][path] = sig
+        S["busy"] = True
         try:
             out = apply_file(path)
             log(f"applied {Path(path).name} rev {out.get('rev')}: {out.get('counts')} in {out.get('seconds')} s")
@@ -998,6 +1002,11 @@ def _watch_tick(dt):
             err = traceback.format_exc()
             unreal.log_error("[BLSYNC] " + err)
             (CTRL / "status.json").write_text(json.dumps({"error": err, "file": path, "t": time.time()}), encoding="utf-8")
+        finally:
+            S["busy"] = False
+        # the file read is the one applied; if it changed meanwhile, the next tick sees a new signature and applies it
+        w["sig"][path] = sig
+        return                                   # one file per tick: the editor gets a frame between applies
 
 
 def watch(paths, interval=0.2, remember=True):
@@ -1029,14 +1038,16 @@ def reset(name):
     return b.apply({"rev": "reset", "instances": {}, "meshes": {}})
 
 
-def detach(name=None):
+def detach(name=None, forget=True):
     """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch
-    (also in the session file: a later restore will not bring it back)."""
-    sess = _session()
-    sess["attach"] = [r for r in sess.get("attach", []) if name and (r.get("name") or r.get("placements")) != name]
-    if not name:
-        sess["watch"] = None
-    _save_session(sess)
+    (also in the session file: a later restore will not bring it back). forget=False (code reload): the session file
+    is kept, so restore() right after brings everything back."""
+    if forget:
+        sess = _session()
+        sess["attach"] = [r for r in sess.get("attach", []) if name and (r.get("name") or r.get("placements")) != name]
+        if not name:
+            sess["watch"] = None
+        _save_session(sess)
     if not name:
         unwatch(remember=False)                   # one batch: the others keep being watched
     out = {}
@@ -1133,7 +1144,17 @@ ACTIONS = ("attach", "apply", "watch", "unwatch", "reset", "detach", "status", "
 
 
 def dispatch(req):
-    """one request (the same JSON bl_sync.py takes) -> report. Used by bl_sync.py and by the control channel."""
+    """one request (the same JSON bl_sync.py takes) -> report. Used by bl_sync.py and by the control channel. While it
+    runs, the watch tick and the control tick stay out (an import inside would otherwise let them run nested)."""
+    was = S.get("busy")
+    S["busy"] = True
+    try:
+        return _dispatch(req)
+    finally:
+        S["busy"] = was
+
+
+def _dispatch(req):
     act = req.get("action", "status")
     if act == "attach":
         return attach(req)
@@ -1173,7 +1194,7 @@ _CTL = {"sig": None, "last": None, "next": 0.0}
 
 def _ctl_tick(dt):
     """Saved/BlSync/request.json -> result.json, 4 times a second, independent of 视效's channel."""
-    if time.monotonic() < _CTL["next"]:
+    if S.get("busy") or time.monotonic() < _CTL["next"]:
         return
     _CTL["next"] = time.monotonic() + 0.25
     try:
