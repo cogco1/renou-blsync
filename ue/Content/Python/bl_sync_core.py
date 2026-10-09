@@ -926,8 +926,12 @@ def apply_file(path, name=None):
     out["applied_at"] = time.time()
     if out.get("written"):
         out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)
-    (CTRL / "status.tmp").write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    (CTRL / "status.tmp").replace(CTRL / "status.json")
+    body = json.dumps(out, ensure_ascii=False)
+    (CTRL / "status.tmp").write_text(body, encoding="utf-8")
+    (CTRL / "status.tmp").replace(CTRL / "status.json")      # the last receipt of any batch (kept for old readers)
+    one = CTRL / f"status_{ov.get('batch') or b.name}.json"   # one receipt per batch: two writers never mix receipts
+    one.with_suffix(".tmp").write_text(body, encoding="utf-8")
+    one.with_suffix(".tmp").replace(one)
     return out
 
 
