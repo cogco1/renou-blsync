@@ -6,6 +6,8 @@ REQUEST {"action": "attach", "placements": "/abs/<batch>_placements.json", "name
         {"action": "detach", "name": optional}   (stop watching, reset, give the guarded level files their write permission back)
         {"action": "where", "name": "<name>", "inst": "<instance id>"}   (centre and yaw of one instance as UE shows it)
         {"action": "materials", "name": "<name>", "inst": ["<id>", ...]}   (mesh and per-slot material of instances)
+        {"action": "attach", "kind": "veg", "placements": "/abs/veg_..._placements.json", "veg": "S02"}   (vegetation, #12)
+        {"action": "suspend"} / {"action": "resume"}   (UE save: previews back to the tables, then re-applied)
         {"action": "fingerprint"}   (R2: lights, sky, fog, post, foliage, cameras and untouched materials, as one hash)
         {"action": "reload"}   (re-import bl_sync_core after an update: drops the state, attach + watch again)
         {"action": "frame", "inst": "<instance id>", "cam": "BLSYNC", "dist": 1.6}   (CineCamera CAM_<cam> looking at it)
@@ -31,6 +33,10 @@ elif act == "unwatch":
     REPORT = core.unwatch()
 elif act == "reset":
     REPORT = core.reset(REQ["name"])
+elif act == "suspend":                               # before UE saves a level that holds previewed actors
+    REPORT = core.suspend()
+elif act == "resume":
+    REPORT = core.resume()
 elif act == "detach":
     REPORT = core.detach(REQ.get("name"))
 elif act == "import_probe":                          # issue #11: time one import into /Game/_LivePreview/_probe, change nothing
@@ -66,6 +72,19 @@ elif act == "import_probe":                          # issue #11: time one impor
     m = next((unreal.load_asset(x) for x in sms if isinstance(unreal.load_asset(x), unreal.StaticMesh)), None)
     REPORT = {"ok": bool(ok), "seconds": round(time.time() - t, 2), "folder": folder, "preview": bool(REQ.get("preview", True)),
               "skipped": skipped, "assets": len(sms), "slots": core.slot_names(m) if m else None}
+elif act == "hosts":                                 # read-only: actors whose tags start with a prefix, their level and HISMs
+    EAS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    pre = REQ.get("prefix", "VEG_")
+    rows = []
+    for a in EAS.get_all_level_actors():
+        tags = [str(t) for t in a.tags]
+        if not any(t.startswith(pre) for t in tags):
+            continue
+        comps = a.get_components_by_class(unreal.HierarchicalInstancedStaticMeshComponent)
+        rows.append({"label": a.get_actor_label(), "level": a.get_outer().get_outer().get_path_name().split(".")[0],
+                     "tags": tags, "hism": len(comps), "instances": sum(c.get_instance_count() for c in comps),
+                     "meshes": sorted({c.get_editor_property("static_mesh").get_name() for c in comps if c.get_editor_property("static_mesh")})})
+    REPORT = {"prefix": pre, "actors": rows}
 elif act == "fingerprint":
     REPORT = core.fingerprint()
 elif act == "materials":

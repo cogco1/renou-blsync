@@ -241,6 +241,7 @@ class Batch:
             self.base[inst["id"]] = st
             self.home[inst["id"]] = (key, idx)
         self.slot = dict(self.home)                 # id -> (comp key, index) where it lives now
+        self.orig_count = {k: c.get_instance_count() for k, c in self.comps.items()}
         self.free = {}                              # comp key -> indices we added and hid again (reusable)
         self.applied = {}                           # id -> normalised override last applied
         self.rev = None
@@ -426,6 +427,37 @@ class Batch:
                                                   "asset": new.get_path_name(), "triangles": tri,
                                                   "seconds": round(time.time() - t, 2)})
 
+    def key_for(self, st):
+        """the HISM (comps key) an instance in state st belongs in, created if needed."""
+        mesh = self.mesh_for(st["part"], fallback=True)
+        if mesh is None:
+            raise KeyError(f"part {st['part']} has no mesh in {self.dest}/parts (send it in 'meshes')")
+        return self.comp_for(st["era"], mesh)
+
+    def trim(self):
+        """back at the table: drop what the preview added, so a later save holds nothing of it - instances appended to a
+        HISM (only the tail, earlier indices never move) and HISMs the preview created. Returns what was removed."""
+        out = {}
+        for key, c in list(self.comps.items()):
+            n0 = self.orig_count.get(key)
+            if n0 is None:                          # a HISM made by the preview (new part / era / slot)
+                c.clear_instances()
+                try:
+                    c.destroy_component(c)
+                except Exception:
+                    pass
+                del self.comps[key]
+                out["hism_removed"] = out.get("hism_removed", 0) + 1
+                continue
+            n = c.get_instance_count()
+            if n > n0:
+                c.remove_instances(list(range(n0, n)))
+                out["instances_removed"] = out.get("instances_removed", 0) + n - n0
+        self.free, self.slot = {}, dict(self.home)
+        if hasattr(self, "slot_comp"):
+            self.slot_comp = {k: v for k, v in self.slot_comp.items() if v in self.comps}
+        return out
+
     def place(self, iid, st):
         """move instance iid to state st (None = remove an added one, deleted = hide)."""
         cur = self.slot.get(iid)
@@ -437,10 +469,7 @@ class Batch:
                     self.free.setdefault(key, []).append(idx)
                     del self.slot[iid]
             return "hidden"
-        mesh = self.mesh_for(st["part"], fallback=True)
-        if mesh is None:
-            raise KeyError(f"part {st['part']} has no mesh in {self.dest}/parts (send it in 'meshes')")
-        key = self.comp_for(st["era"], mesh)
+        key = self.key_for(st)
         if cur and cur[0] == key:
             self.comps[key].update_instance_transform(cur[1], ue_xf(st), True, True, True)
             return "moved"
@@ -486,7 +515,11 @@ class Batch:
                 out.setdefault("errors", []).append(f"{iid}: {exc}")
         self.applied = {k: v for k, v in new.items()}
         self.rev = ov.get("rev")
-        out["save_guard"] = guard(self.level_files, bool(self.applied or self.mesh_sha))
+        if not self.applied and not self.mesh_sha:
+            trimmed = self.trim()
+            if trimmed:
+                out["trimmed"] = trimmed
+        out["save_guard"] = reguard()
         if self.unmapped:
             out["unmapped_slots"] = sorted(self.unmapped)
         out.update(counts=counts, overrides=len(new), seconds=round(time.time() - t0, 3))
@@ -526,8 +559,134 @@ def guard(files, on):
     return sorted(k for k in st if k in files)
 
 
+def reguard():
+    """level files read-only exactly while some attached batch in them differs from its table (and not suspended)."""
+    want, every = set(), set()
+    for b in S["batches"].values():
+        every |= set(b.level_files)
+        if (b.applied or b.mesh_sha) and not S.get("suspended"):
+            want |= set(b.level_files)
+    guard(sorted(want), True)
+    guard(sorted((every | set(_guard_state())) - want), False)
+    return sorted(want)
+
+
+class VegBatch(Batch):
+    """engineering's vegetation placements (renou-placements/1; src = an abstract slot such as tree_broadleaf_A; no parts
+    GLB) on the VEG_<veg>_<era> actors ct_vegplace builds (one HISM per era and slot). The build may have cropped the
+    file to discs, or instances may have been cleared since (lk_vegclear), so instances are found by position.
+    REQUEST {"kind": "veg", "placements": "/abs/veg_<region>_<era>_placements.json", "veg": "S02" (VEG_<veg>_*)}
+    Override files use the table's batch name (veg_peninsula_present ...); "part" of a new instance = its slot.
+    The slot -> mesh mapping stays with UE: Blender never sends vegetation meshes ("meshes" is ignored here)."""
+
+    def __init__(self, req):
+        t0 = time.time()
+        self.placements = Path(req["placements"])
+        self.data = json.loads(self.placements.read_text(encoding="utf-8-sig"))
+        assert self.data.get("schema") == "renou-placements/1", self.data.get("schema")
+        assert self.data.get("coord") == "blender_zup_m", self.data.get("coord")
+        self.base_sha = sha_file(self.placements)
+        self.veg = req["veg"]
+        self.name = req.get("name") or self.data["batch"]
+        self.dest = f"{LIVE_ROOT}/{self.name}"
+        self.prefer = ["NEAR"]
+        self.slot_table_path, self.slot_table, self.slot_table_norm = None, {}, {}
+        self.unmapped = set()
+        self.hosts, self.comps = {}, {}
+        for a in EAS.get_all_level_actors():
+            if f"VEG_{self.veg}" in [str(t) for t in a.tags]:
+                self.hosts[a.get_actor_label().rsplit("_", 1)[-1]] = a
+                for c in a.get_components_by_class(unreal.HierarchicalInstancedStaticMeshComponent):
+                    self.comps[c.get_path_name()] = c
+        assert self.hosts, f"no VEG_{self.veg}_* actors in the open level"
+        index = {}
+        for key, c in self.comps.items():
+            for i in range(c.get_instance_count()):
+                t = c.get_instance_transform(i, True).translation
+                index[(round(t.x), round(t.y), round(t.z))] = (key, i)
+        default_era = self.data.get("era", "both")
+        self.base, self.home, votes = {}, {}, {}
+        missing, bad, worst, checked = 0, 0, 0.0, 0
+        near = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
+        for n, inst in enumerate(self.data.get("instances", [])):
+            st = norm_state(dict(inst, part=inst["src"], era=inst.get("era") or default_era))
+            self.base[inst["id"]] = st
+            x, y, z = st["pos"]
+            k = (round(x * 100), round(-y * 100), round(z * 100))
+            hit = index.get(k)
+            if hit is None:
+                hit = next((index[(k[0] + a, k[1] + b, k[2] + c)] for a, b, c in near
+                            if (k[0] + a, k[1] + b, k[2] + c) in index), None)
+            if hit is None:
+                missing += 1                        # cropped away or cleared in UE: nothing of it is shown
+                continue
+            self.home[inst["id"]] = hit
+            v = votes.setdefault((st["era"], st["part"]), {})
+            v[hit[0]] = v.get(hit[0], 0) + 1
+            if n % 25 == 0:                         # full transform check on a sample
+                e = xf_err(self.comps[hit[0]].get_instance_transform(hit[1], True), st)
+                worst, bad, checked = max(worst, e), bad + (e > 1.0), checked + 1
+        self.slot_comp = {es: max(v, key=v.get) for es, v in votes.items()}
+        self.meshes = {}
+        for (era, slot), key in self.slot_comp.items():
+            self.meshes.setdefault(slot.lower(), self.comps[key].get_editor_property("static_mesh"))
+        self.slot = dict(self.home)
+        self.orig_count = {k: c.get_instance_count() for k, c in self.comps.items()}
+        self.free, self.applied, self.rev, self.mesh_sha, self.keypath, self.mesh_orig = {}, {}, None, {}, {}, {}
+        self.level_files = sorted({level_file(a) for a in self.hosts.values()} - {None})
+        self.report = {"batch": self.data.get("batch"), "kind": "veg", "veg": self.veg, "instances": len(self.base),
+                       "matched": len(self.home), "not_in_level": missing, "hism": len(self.comps),
+                       "slots": {f"{e}/{sl}": self.comps[k].get_editor_property("static_mesh").get_name()
+                                 for (e, sl), k in sorted(self.slot_comp.items())},
+                       "verify_checked": checked, "verify_bad": bad, "verify_worst_cm": round(worst, 3),
+                       "level_files": self.level_files, "seconds": round(time.time() - t0, 2)}
+        assert bad == 0, f"vegetation in the level does not match the table: {self.report}"
+
+    def mesh_for(self, part, lods=None, fallback=False):
+        return self.meshes.get(part.lower())
+
+    def key_for(self, st):
+        key = self.slot_comp.get((st["era"], st["part"]))
+        if key is not None:
+            return key
+        mesh = self.mesh_for(st["part"])
+        if mesh is None:
+            raise KeyError(f"slot {st['part']} has no mesh in UE yet (UE maps slots to meshes in ct_vegplace)")
+        before = set(self.comps)
+        key = self.comp_for(st["era"], mesh)        # new HISM on VEG_<veg>_<era>, cull distances as ct_vegplace
+        if key not in before:
+            lo, hi = (250, 400) if st["part"].startswith("shrub") else (1200, 1800)
+            self.comps[key].set_editor_property("instance_start_cull_distance", int(lo * 100))
+            self.comps[key].set_editor_property("instance_end_cull_distance", int(hi * 100))
+        self.slot_comp[(st["era"], st["part"])] = key
+        return key
+
+    def update_meshes(self, meshes, out):
+        if meshes:
+            out.setdefault("errors", []).append("vegetation batches take no meshes (slot -> mesh is UE's)")
+
+    def revert_meshes(self, keep, out):
+        pass
+
+
+def suspend():
+    """before UE saves: every preview goes back to its table for a moment (files writable). Nothing is lost - override
+    files are cumulative and resume() simply reads them again."""
+    S["suspended"] = True
+    out = {n: b.apply({"rev": "suspended", "instances": {}, "meshes": {}}) for n, b in S["batches"].items()}
+    out["save_guard"] = reguard()
+    return out
+
+
+def resume():
+    S["suspended"] = False
+    if S.get("watch"):
+        S["watch"]["sig"] = {}                      # next tick applies every watched file again
+    return {"resumed": True, "watching": (S.get("watch") or {}).get("paths")}
+
+
 def attach(req):
-    b = Batch(req)
+    b = VegBatch(req) if req.get("kind") == "veg" else Batch(req)
     S["batches"][b.name] = b
     log(f"attached {b.name}: {b.report}")
     return b.report
@@ -549,7 +708,7 @@ def apply_file(path, name=None):
 
 def _watch_tick(dt):
     w = S["watch"]
-    if not w or time.monotonic() < w["next"]:
+    if not w or S.get("suspended") or time.monotonic() < w["next"]:
         return
     w["next"] = time.monotonic() + w["interval"]
     for path in w["paths"]:
@@ -601,6 +760,7 @@ def detach(name=None):
             del S["batches"][n]
     left = _guard_state()
     guard(list(left), False)                      # also files guarded by an earlier editor session
+    S["suspended"] = False
     out["unguarded"] = sorted(left)
     return out
 
