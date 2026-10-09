@@ -76,6 +76,10 @@ class Worker(threading.Thread):
             try:
                 res = B.deliver(ov)
                 res["ue"] = self._wait(name, B, ov)
+                if res["ue"] and res["ue"].get("complete") is False:
+                    # #28: positions are in, new meshes still importing in UE: show that, then wait for the rest
+                    self._post(name, dict(res), ov, t0)
+                    res["ue"] = self._wait(name, B, ov, complete=True, limit=state.MESH_WAIT) or res["ue"]
             except Exception as e:                      # e.g. ssh failed: shown in the panel, the next change retries
                 res = {"rev": ov["rev"], "overrides": len(ov["instances"]), "ue": None, "error": f"{type(e).__name__}: {e}"}
             res.update(label=ov.get("label", ""), seconds=round(time.time() - t0, 3), t=time.time())
@@ -83,10 +87,15 @@ class Worker(threading.Thread):
                 self.results[name] = res
                 self.busy = False
 
-    def _wait(self, name, B, ov):
+    def _post(self, name, res, ov, t0):
+        res.update(label=ov.get("label", ""), seconds=round(time.time() - t0, 3), t=time.time())
+        with self.cv:
+            self.results[name] = res
+
+    def _wait(self, name, B, ov, complete=False, limit=None):
         t0 = time.time()
-        while time.time() - t0 < state.RECEIPT_WAIT:
-            st = B.wait_receipt(ov, wait=0.25)
+        while time.time() - t0 < (limit or state.RECEIPT_WAIT):
+            st = B.wait_receipt(ov, wait=0.25, complete=complete)
             if st:
                 return st
             with self.cv:

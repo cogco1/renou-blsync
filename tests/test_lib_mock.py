@@ -44,6 +44,26 @@ try:
     c = Bf.centre(Bf.group("BLK_BAKED"), base=False)
     check("fast mode: world-baked block centre from the GLB header", (c - Vector((110, 60, 20))).length < 1e-3, tuple(c))
 
+    # #28: UE answers a rev twice when new meshes import in the background (complete false, then true)
+    pdir = out / "pending_receipts"
+    pdir.mkdir()
+    Bf.status = pdir / "status.json"
+    own = pdir / f"status_{Bf.batch}.json"
+    doc = {"rev": 7, "written": time.time()}
+    own.write_text(json.dumps({"rev": 7, "complete": False, "pending_meshes": ["P_NEW"]}), encoding="utf-8")
+    first = Bf.wait_receipt(doc, wait=1)
+    check("#28: the first receipt (meshes still importing) is returned by default",
+          first and first.get("pending_meshes") == ["P_NEW"], first)
+    check("#28: complete=True does not take the incomplete receipt", Bf.wait_receipt(doc, wait=0.3, complete=True) is None)
+    import threading
+    threading.Timer(0.3, lambda: own.write_text(json.dumps({"rev": 7, "complete": True, "meshes": [{"part": "P_NEW"}]}),
+                                                encoding="utf-8")).start()
+    done = Bf.wait_receipt(doc, wait=5, complete=True)
+    check("#28: complete=True returns the receipt written when the meshes are in", done and done.get("complete") is True, done)
+    own.write_text(json.dumps({"rev": 8}), encoding="utf-8")
+    check("#28: receipts without the field (older bl_sync) count as complete",
+          Bf.wait_receipt({"rev": 8, "written": time.time()}, wait=1, complete=True) is not None)
+
     # full mode
     B = rb.Batch(P, out=OV, parts_glb=G, status=ST)
     r = B.publish("baseline", wait=10)

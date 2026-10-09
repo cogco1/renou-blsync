@@ -196,13 +196,21 @@ def glb_material_names(glb):
     return list(glb_materials(glb))
 
 
-def interchange_mesh(glb, folder, preview=True, materials=False):
+_ASYNC = {}         # folder -> async import record (module level: one import per folder, whichever batch asked first)
+ASYNC_MAX = 3       # imports running at the same time; the rest wait in "queued"
+ASYNC_TIMEOUT = 900.0
+
+
+def interchange_mesh(glb, folder, preview=True, materials=False, on_done=None):
     """import one part GLB as plain Nanite static mesh(es) into folder, replacing assets of the same name in place.
     preview (issue #11, 视效 agreed 10-09): no distance field and no collision - a preview mesh only shows position and
     volume; Lumen soft shadows / GI on it are a little worse until the formal ct_placements rebuild.
     materials=False (issue #11): the GLB's own materials are not imported - making their instances and compiling their
     shaders was 15 of the 17 s in the live editor (0.1 s without); UE gives every slot its own material anyway. Only
-    needed when a slot must keep the GLB material (KEEP_GLB) and UE has no material for that slot name yet."""
+    needed when a slot must keep the GLB material (KEEP_GLB) and UE has no material for that slot name yet.
+    on_done (issue #28): asynchronous import, returns at once; on_done(objects) runs on the game thread when the assets
+    exist. Test editor 10-09, one 250 m tower: the synchronous import held the game thread 4.95 s, the asynchronous one
+    took 6 s with the longest gap between two editor ticks 0.35 s."""
     mgr = unreal.InterchangeManager.get_interchange_manager_scripted()
     params = unreal.ImportAssetParameters()
     params.set_editor_property("is_automated", True)
@@ -223,7 +231,48 @@ def interchange_mesh(glb, folder, preview=True, materials=False):
     params.set_editor_property("override_pipelines", [
         unreal.SoftObjectPath(pipe.get_path_name()),
         unreal.SoftObjectPath("/Interchange/Pipelines/DefaultGLTFPipeline.DefaultGLTFPipeline")])
-    return mgr.import_asset(folder, mgr.create_source_data(str(glb)), params)
+    if on_done is None:
+        return mgr.import_asset(folder, mgr.create_source_data(str(glb)), params)
+    d = params.get_editor_property("on_assets_import_done")
+    d.bind_callable(on_done)
+    params.set_editor_property("on_assets_import_done", d)
+    _ASYNC.setdefault(folder, {})["keep"] = (params, pipe, on_done)     # alive until the callback has run
+    return mgr.scripted_import_asset_async(folder, mgr.create_source_data(str(glb)), params)
+
+
+def _start_import(rec):
+    def done(objs):                                 # exactly one parameter: UE checks the callable's signature
+        rec["state"] = "done"
+        rec["done_t"] = time.time()
+        rec["objs"] = [o.get_path_name() for o in (objs or [])]
+    rec["state"], rec["start_t"] = "running", time.time()
+    try:
+        ok = interchange_mesh(rec["glb"], rec["folder"], materials=rec["need_mats"], on_done=done)
+    except Exception as exc:
+        ok, rec["error"] = False, f"{type(exc).__name__}: {exc}"
+    if not ok:
+        rec["state"], rec["done_t"] = "failed", time.time()
+        rec.setdefault("error", "Interchange did not start the import")
+
+
+def _pump_imports():
+    """start queued imports while fewer than ASYNC_MAX run (only those an attached batch still waits for); time out the
+    ones that never report back."""
+    now = time.time()
+    for r in _ASYNC.values():
+        if r.get("state") == "running" and now - r["start_t"] > ASYNC_TIMEOUT:
+            r["state"], r["done_t"], r["error"] = "failed", now, f"no answer from Interchange after {ASYNC_TIMEOUT:.0f} s"
+    wanted = {i["folder"] for b in S["batches"].values() for i in getattr(b, "pending", {}).values()}
+    for folder in [f for f, r in _ASYNC.items() if r.get("state") == "queued" and f not in wanted]:
+        del _ASYNC[folder]                          # nobody waits for it any more (dropped from the file, detached)
+    for r in sorted((r for r in _ASYNC.values() if r.get("state") == "queued"), key=lambda r: r["queued_t"]):
+        if sum(1 for x in _ASYNC.values() if x.get("state") == "running") >= ASYNC_MAX:
+            break
+        _start_import(r)
+
+
+class MeshPending(Exception):
+    """the instance's part is still being imported (#28): it is placed when the mesh is there."""
 
 
 class Batch:
@@ -279,6 +328,8 @@ class Batch:
         self.mesh_sha = {}
         self.keypath = {}                           # live mesh path -> the batch mesh path its HISMs are keyed by
         self.mesh_orig = {}                         # part -> the batch's own mesh (to switch back on reset)
+        self.pending, self.last_ov = {}, None       # #28: part -> async import it waits for; the last override applied
+        self.sync_import = bool(req.get("sync_import"))
         # verify the mapping against what is really in the level
         worst, bad, missing_comp = 0.0, 0, 0
         for iid, (key, idx) in self.home.items():
@@ -426,62 +477,122 @@ class Batch:
     def update_meshes(self, meshes, out):
         """changed or new part geometry: import the part GLB into its own folder /parts_live/<part>_<sha8>, then point
         every HISM that shows the part at the new mesh (instances, indices and material overrides stay). The batch's
-        original asset is left as it is; HISM keys keep the original mesh path (keypath alias)."""
-        for part, info in (meshes or {}).items():
+        original asset is left as it is; HISM keys keep the original mesh path (keypath alias).
+        #28: a GLB that is not imported yet is imported asynchronously, so the editor keeps running (19 new towers held
+        the live editor 135 s before). Until its mesh is there a changed part keeps showing its old mesh and the
+        instances of a new part wait ("waiting_mesh" in counts); the receipt lists the part in "pending_meshes" and says
+        "complete": false. finish_imports() (control tick) switches the HISMs and applies the file again, which writes
+        the complete receipt. sync_import (attach option, tests) imports in place as before."""
+        meshes = meshes or {}
+        for part in [p for p in self.pending if p not in meshes]:
+            del self.pending[part]                  # left the file before its import finished
+        for part, info in meshes.items():
             glb = Path(info["glb"])
             want = info.get("sha256")
             if want and self.mesh_sha.get(part) == want:
+                continue
+            if want and self.pending.get(part, {}).get("sha") == want:
+                out.setdefault("pending_meshes", []).append(part)
                 continue
             got = sha_file(glb)
             if want and got != want:
                 out.setdefault("errors", []).append(f"mesh {part}: sha {got[:12]} != {want[:12]} (file still being written?)")
                 continue
-            t = time.time()
             folder = f"{LIVE_ROOT}/{self.name}/{part}_{got[:8]}"     # R3: preview assets apart, never in a batch folder
-            found = []
-            if EAL.does_directory_exist(folder):
-                found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
             gm = glb_materials(glb)
             textured = {_norm(n) for n, tex in gm.items() if tex}
             self.textured_now = textured
             need_mats = self.needs_glb_materials(list(gm), self.meshes.get(part.lower()))
-            if not any(isinstance(a, unreal.StaticMesh) for a in found):
-                interchange_mesh(glb, folder, materials=need_mats)
-                found = [unreal.load_asset(p) for p in EAL.list_assets(folder, recursive=True, include_folder=False)]
-            sms = [a for a in found if isinstance(a, unreal.StaticMesh)]
-            new = next((a for a in sms if a.get_name().lower() == part.lower()), sms[0] if len(sms) == 1 else None)
-            if new is None:
-                out.setdefault("errors", []).append(f"mesh {part}: {len(sms)} static meshes in {glb.name}, none named {part}")
+            job = {"folder": folder, "sha": got, "textured": textured, "need_mats": need_mats}
+            rec = _ASYNC.get(folder)
+            if rec is not None and rec["state"] == "failed":
+                if time.time() - rec["done_t"] < 60:
+                    out.setdefault("errors", []).append(f"mesh {part}: import failed: {rec.get('error')}")
+                    continue
+                rec = None                          # try again, at most once a minute
+                del _ASYNC[folder]
+            if rec is None:
+                t = time.time()
+                if EAL.does_directory_exist(folder) and any(
+                        isinstance(unreal.load_asset(p), unreal.StaticMesh)
+                        for p in EAL.list_assets(folder, recursive=True, include_folder=False)):
+                    self.finish_mesh(part, job, out, {"start_t": t})       # imported earlier (reset, re-attach)
+                    continue
+                if self.sync_import:
+                    interchange_mesh(glb, folder, materials=need_mats)
+                    self.finish_mesh(part, job, out, {"start_t": t})
+                    continue
+                rec = _ASYNC[folder] = {"state": "queued", "queued_t": t, "glb": str(glb), "folder": folder,
+                                        "need_mats": need_mats, "part": part}
+            if rec["state"] == "done":
+                self.finish_mesh(part, job, out, rec)
                 continue
-            if not hasattr(self, "textured_by_mesh"):
-                self.textured_by_mesh = {}
-            self.textured_by_mesh[new.get_path_name()] = textured
-            old = self.meshes.get(part.lower())
-            if old is not None and part not in self.mesh_orig:
-                self.mesh_orig[part] = old
-            swapped, slots = 0, None
-            if old:
-                op = old.get_path_name()
-                slots = None
-                for c in self.comps.values():
-                    m = c.get_editor_property("static_mesh")
-                    if m and m.get_path_name() == op:
-                        slots = self.carry_materials(c, m, new)
-                        swapped += 1
-                self.keypath[new.get_path_name()] = self.keypath.get(op, op)
-            self.meshes[part.lower()] = new
-            self.mesh_sha[part] = got
-            tri = new.get_num_triangles(0) if hasattr(new, "get_num_triangles") else None
-            out.setdefault("meshes", []).append({"part": part, "new_part": old is None, "hism_switched": swapped,
-                                                  "glb_materials": need_mats,
-                                                  "slots": slots if old else None,
-                                                  "asset": new.get_path_name(), "triangles": tri,
-                                                  "seconds": round(time.time() - t, 2)})
+            self.pending[part] = job
+            out.setdefault("pending_meshes", []).append(part)
+        _pump_imports()
+
+    def finish_imports(self):
+        """#28, control tick: parts whose import has finished get their mesh, then the last override is applied again
+        (instances that waited appear) -> the receipt to write, or None when nothing finished."""
+        ready = [p for p, j in self.pending.items() if _ASYNC.get(j["folder"], {}).get("state") in ("done", "failed")]
+        if not ready or self.last_ov is None:
+            return None
+        out = {}
+        for part in ready:
+            job = self.pending.pop(part)
+            rec = _ASYNC[job["folder"]]
+            rec.pop("keep", None)
+            if rec["state"] == "done":
+                self.finish_mesh(part, job, out, rec)
+            # failed: apply() below reports it once (update_meshes sees the failed record)
+        res = self.apply(self.last_ov)
+        res["meshes"] = out.get("meshes", []) + res.get("meshes", [])
+        if out.get("errors"):
+            res["errors"] = out["errors"] + res.get("errors", [])
+        return res
+
+    def finish_mesh(self, part, job, out, timing):
+        """the imported mesh in job["folder"] becomes the part's mesh: every HISM that showed the part switches to it."""
+        found = [unreal.load_asset(p) for p in EAL.list_assets(job["folder"], recursive=True, include_folder=False)]
+        sms = [a for a in found if isinstance(a, unreal.StaticMesh)]
+        new = next((a for a in sms if a.get_name().lower() == part.lower()), sms[0] if len(sms) == 1 else None)
+        if new is None:
+            out.setdefault("errors", []).append(f"mesh {part}: {len(sms)} static meshes in {job['folder']}, none named {part}")
+            return
+        textured, need_mats, got = job["textured"], job["need_mats"], job["sha"]
+        if not hasattr(self, "textured_by_mesh"):
+            self.textured_by_mesh = {}
+        self.textured_by_mesh[new.get_path_name()] = textured
+        old = self.meshes.get(part.lower())
+        if old is not None and part not in self.mesh_orig:
+            self.mesh_orig[part] = old
+        swapped, slots = 0, None
+        if old:
+            op = old.get_path_name()
+            for c in self.comps.values():
+                m = c.get_editor_property("static_mesh")
+                if m and m.get_path_name() == op:
+                    slots = self.carry_materials(c, m, new)
+                    swapped += 1
+            self.keypath[new.get_path_name()] = self.keypath.get(op, op)
+        self.meshes[part.lower()] = new
+        self.mesh_sha[part] = got
+        tri = new.get_num_triangles(0) if hasattr(new, "get_num_triangles") else None
+        row = {"part": part, "new_part": old is None, "hism_switched": swapped, "glb_materials": need_mats,
+               "slots": slots if old else None, "asset": new.get_path_name(), "triangles": tri}
+        if timing.get("done_t"):                    # asynchronous: time in the queue and in Interchange
+            row.update(queued_s=round(timing["start_t"] - timing["queued_t"], 2),
+                       import_s=round(timing["done_t"] - timing["start_t"], 2))
+        else:
+            row["seconds"] = round(time.time() - timing["start_t"], 2)
+        out.setdefault("meshes", []).append(row)
 
     def key_for(self, st):
         """the HISM (comps key) an instance in state st belongs in, created if needed."""
         mesh = self.mesh_for(st["part"], fallback=True)
         if mesh is None:
+            if any(p.lower() == st["part"].lower() for p in self.pending):
+                raise MeshPending(st["part"])
             raise KeyError(f"part {st['part']} has no mesh in {self.dest}/parts (send it in 'meshes')")
         return self.comp_for(st["era"], mesh)
 
@@ -547,6 +658,7 @@ class Batch:
         out = {"rev": ov.get("rev"), "written": ov.get("written")}
         if ov.get("base_sha256") and self.base_sha and ov["base_sha256"] != self.base_sha:
             raise ValueError(f"override base {ov['base_sha256'][:12]} != loaded table {self.base_sha[:12]}")
+        self.last_ov = ov
         self.revert_meshes(set(ov.get("meshes") or {}), out)
         self.update_meshes(ov.get("meshes"), out)
         new = {}
@@ -554,7 +666,7 @@ class Batch:
             b = self.base.get(iid)
             merged = dict({"part": b["part"], "era": b["era"], "pos": b["pos"], "quat_wxyz": b["quat"], "scale": b["scale"]} if b else {}, **d)
             new[iid] = norm_state(merged)
-        counts, touched = {}, []
+        counts, touched, waiting = {}, [], set()
         for iid in set(self.applied) | set(new):
             want = new.get(iid) or self.base.get(iid)   # dropped from the file: back to the table (or gone if it was new)
             have = self.applied.get(iid) or self.base.get(iid)
@@ -565,9 +677,15 @@ class Batch:
                 counts[r] = counts.get(r, 0) + 1
                 if r in ("moved", "added", "swapped"):
                     touched.append(iid)
+            except MeshPending:                     # #28: placed by finish_imports() once its mesh is imported
+                waiting.add(iid)
+                counts["waiting_mesh"] = counts.get("waiting_mesh", 0) + 1
             except Exception as exc:
                 out.setdefault("errors", []).append(f"{iid}: {exc}")
-        self.applied = {k: v for k, v in new.items()}
+        # a waiting instance still shows what it showed before, so that is what counts as applied
+        prev = self.applied
+        self.applied = {k: v for k, v in new.items() if k not in waiting}
+        self.applied.update({k: prev[k] for k in waiting if k in prev})
         self.rev = ov.get("rev")
         if not self.applied and not self.mesh_sha:
             trimmed = self.trim()
@@ -580,7 +698,8 @@ class Batch:
                 out["conflicts"] = c
         if self.unmapped:
             out["unmapped_slots"] = sorted(self.unmapped)
-        out.update(counts=counts, overrides=len(new), seconds=round(time.time() - t0, 3))
+        out.update(counts=counts, overrides=len(new), seconds=round(time.time() - t0, 3),
+                   complete=not self.pending)       # false: meshes still importing, a complete receipt follows
         return out
 
 
@@ -691,6 +810,7 @@ class VegBatch(Batch):
         self.slot = dict(self.home)
         self.orig_count = {k: c.get_instance_count() for k, c in self.comps.items()}
         self.free, self.applied, self.rev, self.mesh_sha, self.keypath, self.mesh_orig = {}, {}, None, {}, {}, {}
+        self.pending, self.last_ov = {}, None
         self.level_files = sorted({level_file(a) for a in self.hosts.values()} - {None})
         self.report = {"batch": self.data.get("batch"), "kind": "veg", "veg": self.veg, "instances": len(self.base),
                        "matched": len(self.home), "not_in_level": missing, "hism": len(self.comps),
@@ -816,6 +936,7 @@ class GroundBatch(Batch):
         assert self.tiles, f"no INST_{self.name} ground actors in the open level"
         self.comps, self.base, self.home, self.slot, self.free, self.applied = {}, {}, {}, {}, {}, {}
         self.rev, self.mesh_sha, self.keypath, self.mesh_orig, self.orig_count = None, {}, {}, {}, {}
+        self.pending, self.last_ov = {}, None      # ground tiles are still imported in place (one tile at a time)
         self.meshes = {}
         self.level_files = sorted({level_file(a) for a, _c, _m in self.tiles.values()} - {None})
         self.report = {"batch": self.data["batch"], "kind": "ground", "tiles": len(self.tiles),
@@ -964,17 +1085,45 @@ def apply_file(path, name=None):
     assert ov.get("schema") == "renou-overrides/1", ov.get("schema")
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
-    out = b.apply(ov)
+    return _receipt(b, b.apply(ov))
+
+
+def _receipt(b, out):
     out["applied_at"] = time.time()
     if out.get("written"):
         out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)
     body = json.dumps(out, ensure_ascii=False)
     (CTRL / "status.tmp").write_text(body, encoding="utf-8")
     (CTRL / "status.tmp").replace(CTRL / "status.json")      # the last receipt of any batch (kept for old readers)
-    one = CTRL / f"status_{ov.get('batch') or b.name}.json"   # one receipt per batch: two writers never mix receipts
+    one = CTRL / f"status_{b.data.get('batch') or b.name}.json"   # one receipt per batch: two writers never mix receipts
     one.with_suffix(".tmp").write_text(body, encoding="utf-8")
     one.with_suffix(".tmp").replace(one)
     return out
+
+
+def _imports_tick():
+    """#28: start queued imports; the first batch with a finished import switches its meshes and writes its receipt
+    (one batch per tick)."""
+    if not _ASYNC or S.get("suspended"):
+        return
+    _pump_imports()
+    for b in list(S["batches"].values()):
+        if not b.pending:
+            continue
+        S["busy"] = True
+        try:
+            out = b.finish_imports()
+            if out is not None:
+                _receipt(b, out)
+                log(f"meshes in for {b.name} rev {out.get('rev')}: {[m.get('part') for m in out.get('meshes', [])]} "
+                    f"{out.get('counts')} pending {out.get('pending_meshes')}")
+                return
+        except Exception:
+            err = traceback.format_exc()
+            unreal.log_error("[BLSYNC] " + err)
+            b.pending.clear()                       # never retry a broken finish every tick; the next file change does
+        finally:
+            S["busy"] = False
 
 
 def _sig(path):
@@ -1183,8 +1332,9 @@ def _dispatch(req):
         return materials(req["name"], req["inst"])
     if act == "fingerprint":
         return fingerprint()
-    return {"batches": {k: {"rev": b.rev, "overrides": len(b.applied), "instances": len(b.base)}
-                        for k, b in S["batches"].items()},
+    return {"batches": {k: {"rev": b.rev, "overrides": len(b.applied), "instances": len(b.base),
+                            "pending_meshes": sorted(b.pending)} for k, b in S["batches"].items()},
+            "imports": {r.get("part", f): r.get("state") for f, r in _ASYNC.items() if r.get("state") != "done"},
             "watch": (S["watch"] or {}).get("paths"), "suspended": bool(S.get("suspended")), "session": _session()}
 
 
@@ -1197,6 +1347,7 @@ def _ctl_tick(dt):
     if S.get("busy") or time.monotonic() < _CTL["next"]:
         return
     _CTL["next"] = time.monotonic() + 0.25
+    _imports_tick()
     try:
         st = os.stat(CREQ)
     except FileNotFoundError:
