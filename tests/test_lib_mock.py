@@ -396,6 +396,64 @@ try:
         check("load_overrides: refuses a document of another table version", True)
     S2.publish("snapshot test done", wait=0)
 
+    # Ash 10-10 on #37: unique snapshot names, no write without a copy, all-or-nothing load, SHA check, scene snapshot
+    real_time = rb.time.time
+    rb.time.time = lambda: 1791600000.123
+    try:
+        n1 = rb.snapshot_bytes(SO, b'{"rev": 7, "instances": {"a": 1}}', "same")
+        n2 = rb.snapshot_bytes(SO, b'{"rev": 7, "instances": {"b": 2}}', "same")
+    finally:
+        rb.time.time = real_time
+    check("snapshots: same millisecond, rev and reason, different bytes -> two files, both kept",
+          n1 != n2 and n1.read_bytes() == b'{"rev": 7, "instances": {"a": 1}}' and n2.read_bytes() == b'{"rev": 7, "instances": {"b": 2}}',
+          (n1.name, n2.name))
+    S2.move(S2.group("BLD_02"), (3.0, 0.0, 0.0))
+    S2.publish("before a failing snapshot", wait=0)
+    on_disk = SO.read_bytes()
+    S2.reset()
+    real_snap = rb.snapshot_bytes
+    def no_room(*a, **k):
+        raise OSError("disk full (test)")
+    rb.snapshot_bytes = no_room
+    try:
+        S2.publish("clear while the archive cannot be written", wait=0)
+        check("snapshots: when the copy cannot be made the file is not touched", False)
+    except OSError:
+        check("snapshots: when the copy cannot be made the file is not touched", SO.read_bytes() == on_disk)
+    finally:
+        rb.snapshot_bytes = real_snap
+    good = doc_before                                   # the snapshot from above: 6 instances, 2 part meshes
+    S2.load_overrides(good)
+    before = json.dumps(S2.overrides(), sort_keys=True)
+    def refused(doc, what):
+        try:
+            S2.load_overrides(doc)
+            return False
+        except Exception:
+            return json.dumps(S2.overrides(), sort_keys=True) == before
+    bad_glb = json.loads(json.dumps(good))
+    for m in bad_glb["meshes"].values():
+        m["glb"] = str(out / "no_such_dir" / Path(m["glb"]).name)
+    gone_name = json.loads(json.dumps(good))
+    for m in gone_name["meshes"].values():
+        m["glb"] = str(out / "no_such_dir" / ("x" + Path(m["glb"]).name))
+    bad_sha = json.loads(json.dumps(good))
+    for m in bad_sha["meshes"].values():
+        m["sha256"] = "0" * 64
+    broken = out / "broken_overrides.json"
+    broken.write_text(on_disk.decode("utf-8")[:200], encoding="utf-8")
+    check("load_overrides: a missing GLB refuses the whole document, the scene stays as it was",
+          bool(good["meshes"]) and refused(gone_name, "missing"))
+    for m in bad_glb["meshes"].values():                 # a path that does not exist, same file name: the meshes/
+        m["sha256"] = "0" * 64                           # fallback finds the GLB, the SHA check still refuses it
+    check("load_overrides: a GLB whose SHA-256 differs is refused, also when found through the meshes/ fallback",
+          refused(bad_sha, "sha") and refused(bad_glb, "fallback"))
+    check("load_overrides: a broken JSON file is refused, scene unchanged", refused(str(broken), "json"))
+    sc = S2.snapshot_scene("test")
+    scdoc = json.loads(Path(sc).read_text(encoding="utf-8"))
+    check("snapshot_scene: the scene (unpublished edits included) is kept as an override document",
+          scdoc["instances"] == json.loads(before) and "__test__" in Path(sc).name, Path(sc).name)
+
     # Remote mode uses the real subprocess-based transport, but PATH can only
     # reach these local stand-ins. All data is synthetic; no server is involved.
     original_path = os.environ.get("PATH")
