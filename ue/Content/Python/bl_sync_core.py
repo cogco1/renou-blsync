@@ -937,15 +937,28 @@ def _save_session(sess):
     SESSION.with_suffix(".tmp").replace(SESSION)
 
 
+def record_name(r):
+    """the batch name an attach request resolves to - the key of S["batches"], of session records and of detach(name).
+    Ash 10-10: a vegetation attach without "name" is named after its table's batch, but the session used the
+    placements path, so a single detach never removed the record and a restart brought the batch back."""
+    if r.get("name"):
+        return r["name"]
+    try:
+        return json.loads(Path(r["placements"]).read_text(encoding="utf-8-sig"))["batch"]
+    except Exception:
+        return r.get("placements")
+
+
 def restore():
     """after an editor restart: attach every batch of the session file again and watch its files (the override files
     are cumulative, so the preview comes back as it was). Batches that fail are reported and kept in the file."""
     sess, out = _session(), {"attached": {}, "failed": {}}
     for req in sess.get("attach", []):
+        key = record_name(req)
         try:
-            out["attached"][req.get("name") or req.get("placements")] = attach(req, remember=False)
+            out["attached"][key] = attach(req, remember=False)
         except Exception as exc:
-            out["failed"][req.get("name") or req.get("placements")] = str(exc)[:300]
+            out["failed"][key] = str(exc)[:300]
     w = sess.get("watch")
     if w and w.get("paths"):
         out["watch"] = watch(w["paths"], w.get("interval", 0.2), remember=False)
@@ -958,7 +971,8 @@ def attach(req, remember=True):
     if remember:
         sess = _session()
         keep = {k: v for k, v in req.items() if k not in ("id", "script", "action")}
-        sess["attach"] = [r for r in sess.get("attach", []) if (r.get("name") or r.get("placements")) != b.name] + [keep]
+        keep["name"] = b.name                       # the resolved name, so detach(name) and restore agree
+        sess["attach"] = [r for r in sess.get("attach", []) if record_name(r) != b.name] + [keep]
         _save_session(sess)
     S["batches"][b.name] = b
     log(f"attached {b.name}: {b.report}")
@@ -971,6 +985,9 @@ def apply_file(path, name=None):
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
     out = b.apply(ov)
+    if not hasattr(b, "files"):
+        b.files = set()
+    b.files.add(str(path))                          # detach(name) drops these from the watch
     out["batch"] = ov.get("batch") or b.name      # Ash 10-10: every receipt says whose it is (rev alone can collide)
     out["file"] = str(path)
     out["applied_at"] = time.time()
@@ -1061,14 +1078,22 @@ def detach(name=None, forget=True):
     """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch
     (also in the session file: a later restore will not bring it back). forget=False (code reload): the session file
     is kept, so restore() right after brings everything back."""
+    gone_paths = []
+    if name and S.get("watch"):                   # one batch: its watched files go too (the others keep theirs)
+        b = S["batches"].get(name)
+        mine = {b.data.get("batch"), name} if b else {name}
+        gone_paths = [p for p in S["watch"]["paths"] if p in getattr(b, "files", ()) or _file_batch(p) in mine]
+        S["watch"]["paths"] = [p for p in S["watch"]["paths"] if p not in gone_paths]
     if forget:
         sess = _session()
-        sess["attach"] = [r for r in sess.get("attach", []) if name and (r.get("name") or r.get("placements")) != name]
+        sess["attach"] = [r for r in sess.get("attach", []) if name and record_name(r) != name]
         if not name:
             sess["watch"] = None
+        elif sess.get("watch") and gone_paths:
+            sess["watch"]["paths"] = [p for p in sess["watch"]["paths"] if p not in gone_paths]
         _save_session(sess)
     if not name:
-        unwatch(remember=False)                   # one batch: the others keep being watched
+        unwatch(remember=False)
     out = {}
     for n in ([name] if name else list(S["batches"])):
         if n in S["batches"]:
@@ -1076,6 +1101,7 @@ def detach(name=None, forget=True):
             del S["batches"][n]
     if name:
         out["save_guard"] = reguard()             # only what the remaining batches still need
+        out["unwatched"] = gone_paths
         return out
     left = _guard_state()
     guard(list(left), False)                      # also files guarded by an earlier editor session
