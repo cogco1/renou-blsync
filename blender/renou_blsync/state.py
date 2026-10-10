@@ -18,6 +18,7 @@ DIRTY = set()        # batch names with unpublished changes
 GEO_DIRTY = {}       # batch name -> parts whose mesh may have changed (checked by signature before export)
 RESULTS = {}         # batch name -> last delivery result, main-thread copy for the panel
 LAST_SENT = {}       # batch name -> signature of the last document sent (skip identical live publishes)
+BLOCKED = {}         # batch name -> why it is not published (its file could not be loaded back when attaching)
 SNAPS = {}           # batch name -> (time read, newest snapshots) for the panel (the folder is read at most every 2 s)
 LIVE = False
 LAST_ERROR = ""
@@ -63,5 +64,6 @@ def reset_all():
     RESULTS.clear()
     LAST_SENT.clear()
     SNAPS.clear()
+    BLOCKED.clear()
     LIVE = False
     LAST_ERROR = ""

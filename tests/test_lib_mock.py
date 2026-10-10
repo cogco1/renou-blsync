@@ -2,7 +2,7 @@
     blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.py -- build
 Builds the synthetic fixture (tests/make_fixture.py), starts tests/mock_ue_receiver.py with Blender's own Python, then
 drives the library the way an engineering script would. Prints PASS/FAIL per check; exit code 0 = everything passed."""
-import hashlib, json, os, shlex, shutil, struct, subprocess, sys, time, traceback
+import hashlib, json, math, os, shlex, shutil, struct, subprocess, sys, time, traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,9 +42,58 @@ def receipt_ok(r):
 
 
 try:
+    # #31 / Ash 10-10: rotation comparison in double precision with an angle tolerance
+    import random
+    random.seed(32)
+    bad_same, bad_neg, bad_r7, bad_mat, detected = 0, 0, 0, 0, 0
+    for _ in range(10000):
+        q = Quaternion([random.gauss(0, 1) for _ in range(4)])
+        q.normalize()
+        bad_same += not rb.same_rotation(q, q)
+        bad_neg += not rb.same_rotation(q, -q)
+        r7 = [round(v, 7) for v in q]
+        bad_r7 += not rb.same_rotation(q, Quaternion(r7))
+        _l, q2, _s = Matrix.LocRotScale(Vector((4000.0, -3500.0, 120.0)), Quaternion(r7), Vector((1.3, 1.3, 1.3))).decompose()
+        bad_mat += not rb.same_rotation(Quaternion(r7), q2)
+        axis = Vector([random.gauss(0, 1) for _ in range(3)]).normalized()
+        detected += not rb.same_rotation(q, Quaternion(axis, math.radians(0.01)) @ q)
+    check("same_rotation: 10,000 random rotations equal to themselves, to -q, to 7 decimals and after a matrix round trip",
+          bad_same == bad_neg == bad_r7 == bad_mat == 0, (bad_same, bad_neg, bad_r7, bad_mat))
+    check("same_rotation: a 0.01 deg turn about any axis is a change", detected == 10000, detected)
+    ash = Quaternion((0.012953181751072407, -0.532923698425293, 0.8209651708602905, 0.20455056428909302))
+    check("same_rotation: Ash's float32 example is the same rotation", rb.same_rotation(ash, ash) and rb.rotation_angle(ash, ash) == 0.0)
+
     # fast mode: Empties only, part bounds read from the GLB header
     Bf = rb.Batch(P, out=out / "fast_overrides.json", parts_glb=G, status=ST, load_meshes=False)
     check("fast mode baseline: no overrides, also for the w = 0 row (#31)", Bf.overrides() == {}, list(Bf.overrides())[:3])
+    # Ash 10-10 (#33): a receipt is only taken when it is this batch's
+    rd = out / "receipt_identity"
+    rd.mkdir()
+    Bf.status = rd / "status.json"
+    own_f, shared_f = rd / f"status_{Bf.batch}.json", rd / "status.json"
+    def put(f, d):
+        f.write_text(json.dumps(d), encoding="utf-8")
+    now = time.time()
+    put(own_f, {"batch": Bf.batch, "rev": 122})
+    put(shared_f, {"batch": "OTHER", "rev": 123, "counts": {"moved": 999}})
+    check("receipts: another batch's receipt with my rev in the shared file is not mine",
+          Bf.wait_receipt({"rev": 123, "written": now}, wait=0.3) is None)
+    put(shared_f, {"rev": 123, "counts": {"moved": 999}})
+    check("receipts: a shared receipt that names no batch is not believed", Bf.wait_receipt({"rev": 123, "written": now}, wait=0.3) is None)
+    put(shared_f, {"batch": "OTHER", "error": "theirs", "t": now + 5})
+    check("receipts: another batch's error is not mine", Bf.wait_receipt({"rev": 123, "written": now}, wait=0.3) is None)
+    put(shared_f, {"batch": Bf.batch, "error": "mine", "t": now + 5})
+    got = Bf.wait_receipt({"rev": 123, "written": now}, wait=1)
+    check("receipts: my own error (newer than the file) is returned", got and got.get("error") == "mine", got)
+    put(shared_f, {"batch": "OTHER", "rev": 124})
+    put(own_f, {"batch": Bf.batch, "rev": 124, "counts": {"moved": 1}})
+    got = Bf.wait_receipt({"rev": 124, "written": now}, wait=1)
+    check("receipts: two batches with the same rev each get their own", got and got.get("counts") == {"moved": 1}, got)
+    put(own_f, {"rev": 125})
+    check("receipts: an old bl_sync receipt without batch is believed from the batch's own file",
+          (Bf.wait_receipt({"rev": 125, "written": now}, wait=1) or {}).get("rev") == 125)
+    Bf.status = ST
+
     c = Bf.centre(Bf.group("BLK_BAKED"), base=False)
     check("fast mode: world-baked block centre from the GLB header", (c - Vector((110, 60, 20))).length < 1e-3, tuple(c))
 
@@ -347,6 +396,64 @@ try:
         check("load_overrides: refuses a document of another table version", True)
     S2.publish("snapshot test done", wait=0)
 
+    # Ash 10-10 on #37: unique snapshot names, no write without a copy, all-or-nothing load, SHA check, scene snapshot
+    real_time = rb.time.time
+    rb.time.time = lambda: 1791600000.123
+    try:
+        n1 = rb.snapshot_bytes(SO, b'{"rev": 7, "instances": {"a": 1}}', "same")
+        n2 = rb.snapshot_bytes(SO, b'{"rev": 7, "instances": {"b": 2}}', "same")
+    finally:
+        rb.time.time = real_time
+    check("snapshots: same millisecond, rev and reason, different bytes -> two files, both kept",
+          n1 != n2 and n1.read_bytes() == b'{"rev": 7, "instances": {"a": 1}}' and n2.read_bytes() == b'{"rev": 7, "instances": {"b": 2}}',
+          (n1.name, n2.name))
+    S2.move(S2.group("BLD_02"), (3.0, 0.0, 0.0))
+    S2.publish("before a failing snapshot", wait=0)
+    on_disk = SO.read_bytes()
+    S2.reset()
+    real_snap = rb.snapshot_bytes
+    def no_room(*a, **k):
+        raise OSError("disk full (test)")
+    rb.snapshot_bytes = no_room
+    try:
+        S2.publish("clear while the archive cannot be written", wait=0)
+        check("snapshots: when the copy cannot be made the file is not touched", False)
+    except OSError:
+        check("snapshots: when the copy cannot be made the file is not touched", SO.read_bytes() == on_disk)
+    finally:
+        rb.snapshot_bytes = real_snap
+    good = doc_before                                   # the snapshot from above: 6 instances, 2 part meshes
+    S2.load_overrides(good)
+    before = json.dumps(S2.overrides(), sort_keys=True)
+    def refused(doc, what):
+        try:
+            S2.load_overrides(doc)
+            return False
+        except Exception:
+            return json.dumps(S2.overrides(), sort_keys=True) == before
+    bad_glb = json.loads(json.dumps(good))
+    for m in bad_glb["meshes"].values():
+        m["glb"] = str(out / "no_such_dir" / Path(m["glb"]).name)
+    gone_name = json.loads(json.dumps(good))
+    for m in gone_name["meshes"].values():
+        m["glb"] = str(out / "no_such_dir" / ("x" + Path(m["glb"]).name))
+    bad_sha = json.loads(json.dumps(good))
+    for m in bad_sha["meshes"].values():
+        m["sha256"] = "0" * 64
+    broken = out / "broken_overrides.json"
+    broken.write_text(on_disk.decode("utf-8")[:200], encoding="utf-8")
+    check("load_overrides: a missing GLB refuses the whole document, the scene stays as it was",
+          bool(good["meshes"]) and refused(gone_name, "missing"))
+    for m in bad_glb["meshes"].values():                 # a path that does not exist, same file name: the meshes/
+        m["sha256"] = "0" * 64                           # fallback finds the GLB, the SHA check still refuses it
+    check("load_overrides: a GLB whose SHA-256 differs is refused, also when found through the meshes/ fallback",
+          refused(bad_sha, "sha") and refused(bad_glb, "fallback"))
+    check("load_overrides: a broken JSON file is refused, scene unchanged", refused(str(broken), "json"))
+    sc = S2.snapshot_scene("test")
+    scdoc = json.loads(Path(sc).read_text(encoding="utf-8"))
+    check("snapshot_scene: the scene (unpublished edits included) is kept as an override document",
+          scdoc["instances"] == json.loads(before) and "__test__" in Path(sc).name, Path(sc).name)
+
     # 10-10: optional placements fields (layer, recipe, group, pair, event, lock, tags) and unknown fields pass through
     F3 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
     b5 = F3.where(layer="L3")
@@ -378,6 +485,31 @@ try:
     fut = next(r for r in base_rows.values() if "x_future" in r)
     check("write_back: untouched rows stay identical, unknown fields included",
           rows[fut["id"]] == fut and rows[b5[2]["blsync_id"]] == base_rows[b5[2]["blsync_id"]])
+    # Ash 10-10 on #39: a new / copied instance's optional fields travel in the override, so a reload keeps them
+    sd = b5[2].copy()                                    # what Shift+D does: same id, same custom properties
+    F3.col.objects.link(sd)
+    sd.location.y += 60.0
+    F3.fix_duplicates()
+    ovs = F3.overrides()
+    keep_meta = {"layer": "L3", "recipe": "F_QUAY_LOAD", "group": "g012", "event": "E-H3-1", "tags": ["clutter", "nocol"]}
+    check("meta: a copy's override entry carries its layer / recipe / group / event / tags, not pair or lock",
+          all({k: ovs[o["blsync_id"]].get(k) for k in keep_meta} == keep_meta and "pair" not in ovs[o["blsync_id"]]
+              and "lock" not in ovs[o["blsync_id"]] for o in (cp, sd)), {k: ovs[cp["blsync_id"]].get(k) for k in ("layer", "pair", "lock")})
+    F3.publish("meta travels", wait=0)
+    F4 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
+    F4.load_overrides(F4.read_out())
+    back = {o["blsync_id"]: F4.meta(o) for o in F4.col.objects if o.get("blsync_id") in (cp["blsync_id"], sd["blsync_id"])}
+    check("meta: after a reload (new Batch + load_overrides) both copies have their fields again",
+          len(back) == 2 and all({k: m.get(k) for k in keep_meta} == keep_meta for m in back.values()), back)
+    wb4 = {r["id"]: r for r in json.loads(Path(F4.write_back(out / "fields_wb4")["placements"]).read_text(encoding="utf-8"))["instances"]}
+    check("meta: write_back after the reload writes them into the new rows, lock = hand",
+          all({k: wb4[i].get(k) for k in keep_meta} == keep_meta and wb4[i]["lock"] == "hand" and "pair" not in wb4[i] for i in back),
+          {i: {k: wb4[i].get(k) for k in ("layer", "group", "lock")} for i in back})
+    snapb = F4.snapshot_scene("meta-check")
+    F5 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
+    F5.load_overrides(str(snapb))
+    check("meta: a snapshot restore keeps them too",
+          all({k: F5.meta(o).get(k) for k in keep_meta} == keep_meta for o in F5.col.objects if o.get("blsync_id") in back))
     wb2 = F3.write_back(out / "fields_wb", lock_edits=False)
     check("write_back(lock_edits=False) leaves lock as it was",
           {r["id"]: r for r in json.loads(Path(wb2["placements"]).read_text(encoding="utf-8"))["instances"]}[b5[0]["blsync_id"]]["lock"] == "proc")
