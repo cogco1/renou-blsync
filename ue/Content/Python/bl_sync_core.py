@@ -708,7 +708,12 @@ class Batch:
         self.revert_meshes(set(ov.get("meshes") or {}), out)
         self.update_meshes(ov.get("meshes"), out)
         new = {}
+        meta = getattr(self, "meta", None)
         for iid, d in (ov.get("instances") or {}).items():
+            if meta is not None and iid not in self.base:   # a new instance's optional fields come in its entry
+                m = {k: d[k] for k in OPTIONAL_FIELDS if k in d}
+                if m:
+                    meta[iid] = m
             b = self.base.get(iid)
             merged = dict({"part": b["part"], "era": b["era"], "pos": b["pos"], "quat_wxyz": b["quat"], "scale": b["scale"]} if b else {}, **d)
             new[iid] = norm_state(merged)

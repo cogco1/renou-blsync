@@ -548,7 +548,17 @@ class Batch:
         iid = f"{self.batch}_bl{int(time.time()) % 100000:05d}{self.added:03d}"
         o["blsync_id"] = iid
         o.name = iid
+        self._new_identity(o)
         return iid
+
+    def _new_identity(self, o):
+        """a copy keeps its source's layer, recipe, group, event, tags - but the other era's twin (pair) and the source's
+        lock belong to the source (程序化布景调研 §4.9; write_back marks new rows lock = hand)."""
+        m = self.meta(o)
+        if "pair" in m or "lock" in m:
+            m.pop("pair", None)
+            m.pop("lock", None)
+            o["blsync_meta"] = json.dumps(m, ensure_ascii=False)
 
     def fix_duplicates(self):
         """the registered object keeps its id; every other object in the collection holding the same id gets a new one.
@@ -579,6 +589,7 @@ class Batch:
             iid = f"{self.batch}_bl{int(time.time()) % 100000:05d}{self.added:03d}"
             n.name = iid
             n["blsync_id"] = iid
+            self._new_identity(n)
             n.matrix_world = Matrix.Translation(Vector(d)) @ o.matrix_world
             self.col.objects.link(n)
             new.append(n)
@@ -690,6 +701,9 @@ class Batch:
                 o = bpy.data.objects.new(iid, self.meshes.get(part))
                 o["blsync_id"], o["blsync_part"] = iid, part
                 o["blsync_era"], o["blsync_src"] = e.get("era", "both"), e.get("src", "")
+                meta = optional_fields(e)
+                if meta:                                 # the new instance's layer, group, tags ... come back with it
+                    o["blsync_meta"] = json.dumps(meta, ensure_ascii=False)
                 o.matrix_world = mat_of(e)
                 self.col.objects.link(o)
         try:
@@ -728,7 +742,9 @@ class Batch:
             e = {"pos": [round(v, 5) for v in loc], "quat_wxyz": [round(v, 7) for v in q], "scale": [round(v, 6) for v in s]}
             rec = self.base.get(iid)
             if rec is None:
-                inst[iid] = dict(e, part=o["blsync_part"], era=o["blsync_era"], src=o["blsync_src"])
+                # Ash 10-10: a new instance's optional fields live only here, so they travel in the override (a reload
+                # or a snapshot restore gets them back; write_back writes them into the new row)
+                inst[iid] = dict(e, part=o["blsync_part"], era=o["blsync_era"], src=o["blsync_src"], **optional_fields(self.meta(o)))
                 continue
             bl, bq, bs = decompose(mat_of(rec))
             moved = (loc - bl).length > 1e-4 or not same_rotation(bq, q) or (s - bs).length > 1e-5
@@ -913,9 +929,9 @@ class Batch:
                  "district": src_rec.get("district", self.batch), "zone": src_rec.get("zone", ""), "era": e.get("era", "both"),
                  "building_id": src_rec.get("building_id", ""), "src": e.get("src", "")}
             o = next((x for x in self.col.objects if x.get("blsync_id") == iid), None)
-            inherit = optional_fields(self.meta(o)) if o is not None else {}
-            inherit.pop("pair", None)        # the other era's twin belongs to the source, not to a copy
-            r.update(inherit)                # a copy keeps its source's layer, recipe, group, event, tags
+            # the instance's own optional fields (a copy got its source's at adopt / copy, without pair and lock);
+            # from the object when it is there, else from the override entry (it carries them since 10-10)
+            r.update(optional_fields(self.meta(o)) if o is not None else optional_fields(e))
             if lock_edits:
                 r["lock"] = "hand"
             rows.append(r)

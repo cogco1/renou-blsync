@@ -19,7 +19,11 @@ for r in d["instances"]:
         r["x_future"] = {"a": [1, 2, 3]}
 open(pl, "w").write(json.dumps(d))
 o = {"schema": "renou-overrides/1", "batch": "area_04_03", "base_sha256": hashlib.sha256(open(pl, "rb").read()).hexdigest(),
-     "rev": 1, "written": time.time(), "instances": {"area_04_03_000646": {"pos": [25.0, 0, 0], "quat_wxyz": [1, 0, 0, 0], "scale": [1, 1, 1]}}}
+     "rev": 1, "written": time.time(), "instances": {"area_04_03_000646": {"pos": [25.0, 0, 0], "quat_wxyz": [1, 0, 0, 0], "scale": [1, 1, 1]},
+                                                    "area_04_03_bl_new1": {"part": next(r for r in d["instances"] if r["id"] == "area_04_03_000646")["part"],
+                                                                           "era": "both", "src": "fields test", "pos": [700, -700, 0],
+                                                                           "quat_wxyz": [1, 0, 0, 0], "scale": [1, 1, 1],
+                                                                           "layer": "L5", "group": "g9", "tags": ["helper"]}}}
 open(ov + ".tmp", "w").write(json.dumps(o)); os.replace(ov + ".tmp", ov)
 print("table with optional fields on 2 rows and x_future on 1 row")
 PY
@@ -30,5 +34,6 @@ b "{\"action\": \"attach\", \"placements\": \"$PL\", \"name\": \"A0403\"}" 120
 b "{\"action\": \"apply\", \"overrides\": \"$OV\", \"name\": \"A0403\"}" 120
 b '{"action": "where", "name": "A0403", "inst": "area_04_03_000646"}' 30
 b '{"action": "where", "name": "A0403", "inst": "area_04_03_000648"}' 30
+b '{"action": "where", "name": "A0403", "inst": "area_04_03_bl_new1"}' 30
 q bl_sync_verify.py '{"name": "A0403", "all": true}' 60
 b '{"action": "detach"}' 120
