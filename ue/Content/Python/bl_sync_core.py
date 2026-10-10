@@ -547,19 +547,24 @@ class Batch:
 
     def finish_imports(self):
         """#28, control tick: parts whose import has finished get their mesh, then the last override is applied again
-        (instances that waited appear) -> the receipt to write, or None when nothing finished."""
+        (instances that waited appear) -> the receipt to write, or None when nothing finished.
+        Ash 10-10: a part leaves `pending` only once its mesh is in, and a re-apply that failed is owed (reapply_due):
+        if finish_mesh() or apply() raises, the retry of _imports_tick still has the work to do."""
         ready = [p for p, j in self.pending.items() if _ASYNC.get(j["folder"], {}).get("state") in ("done", "failed")]
-        if not ready or self.last_ov is None:
+        if (not ready and not getattr(self, "reapply_due", False)) or self.last_ov is None:
             return None
         out = {}
         for part in ready:
-            job = self.pending.pop(part)
+            job = self.pending[part]
             rec = _ASYNC[job["folder"]]
-            rec.pop("keep", None)
             if rec["state"] == "done":
-                self.finish_mesh(part, job, out, rec)
+                self.finish_mesh(part, job, out, rec)   # raises: the part stays pending and is tried again
             # failed: apply() below reports it once (update_meshes sees the failed record)
+            del self.pending[part]
+            rec.pop("keep", None)
+            self.reapply_due = True
         res = self.apply(self.last_ov)
+        self.reapply_due = False
         res["meshes"] = out.get("meshes", []) + res.get("meshes", [])
         if out.get("errors"):
             res["errors"] = out["errors"] + res.get("errors", [])
@@ -1309,7 +1314,7 @@ def _imports_tick():
         return
     _pump_imports()
     for b in list(S["batches"].values()):
-        if not b.pending:
+        if not b.pending and not getattr(b, "reapply_due", False):
             continue
         if time.time() - getattr(b, "finish_failed", 0.0) < FINISH_RETRY_S:
             continue
@@ -1328,7 +1333,8 @@ def _imports_tick():
             b.finish_failed = time.time()
             write_receipt(b.data.get("batch") or b.name,
                           {"rev": b.rev, "error": err[-2000:], "t": time.time(), "complete": False,
-                           "pending_meshes": sorted(b.pending), "retry_in_s": FINISH_RETRY_S})
+                           "pending_meshes": sorted(b.pending), "reapply_due": bool(getattr(b, "reapply_due", False)),
+                           "retry_in_s": FINISH_RETRY_S})
         finally:
             S["busy"] = False
 
