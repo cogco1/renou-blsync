@@ -32,8 +32,10 @@ q user_cam.py '{"mode": "delete"}' 60
 echo "== 2. new part with unmapped slots, then the same part with new geometry"
 w 1 P28_T170.glb
 q bl_sync.py "{\"action\": \"apply\", \"overrides\": \"$OV\", \"name\": \"A0403\"}" 300
+for i in $(seq 1 120); do python3 -c "import json,sys; s=json.load(open('$PROJ/Saved/BlSync/status.json')); sys.exit(0 if s.get('complete', True) and s.get('rev') == 1 else 1)" 2>/dev/null && break; sleep 1; done   # async import (#28): wait for the complete receipt
 python3 -c "import json; s=json.load(open('$PROJ/Saved/BlSync/status.json')); print('rev', s.get('rev'), 'unmapped', s.get('unmapped_slots'))"
 w 2 A32_T170_v2.glb
 q bl_sync.py "{\"action\": \"apply\", \"overrides\": \"$OV\", \"name\": \"A0403\"}" 300
-python3 -c "import json; s=json.load(open('$PROJ/Saved/BlSync/status.json')); print('rev', s.get('rev'), 'unmapped', s.get('unmapped_slots'), 'slots', {k: v[1] for k, v in ((s.get('meshes') or [{}])[0].get('slots') or {}).items()})"
+for i in $(seq 1 120); do python3 -c "import json,sys; s=json.load(open('$PROJ/Saved/BlSync/status.json')); sys.exit(0 if s.get('complete', True) and s.get('rev') == 2 else 1)" 2>/dev/null && break; sleep 1; done   # async import (#28): wait for the complete receipt
+python3 -c "import json; s=json.load(open('$PROJ/Saved/BlSync/status.json')); print('rev', s.get('rev'), 'unmapped', s.get('unmapped_slots'), 'slots', {k: v[1] for m in (s.get('meshes') or []) for k, v in (m.get('slots') or {}).items()})"
 q bl_sync.py '{"action": "detach"}' 120
