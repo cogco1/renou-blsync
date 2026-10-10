@@ -496,10 +496,13 @@ class Batch:
             res["push_s"] = self._push_file(self.out)
         return res
 
-    def wait_receipt(self, ov, wait=30.0):
+    def wait_receipt(self, ov, wait=30.0, complete=False):
         """any thread: UE's receipt for this rev (or an error newer than the file), or None after `wait` s.
         bl_sync writes one receipt per batch (status_<batch>.json) besides the shared status.json: the batch's own
-        file is read first, so two writers on two batches never pick up each other's receipt."""
+        file is read first, so two writers on two batches never pick up each other's receipt.
+        New meshes are imported in the background (#28): the first receipt for a rev can say "complete": false and list
+        "pending_meshes" (positions are already applied, instances of new parts wait); another receipt for the same rev
+        follows when the meshes are in. complete=True waits for that one."""
         t0 = time.time()
         while wait and time.time() - t0 < wait:
             for own, text in self._read_statuses():
@@ -513,7 +516,7 @@ class Batch:
                     if st.get("t", 0) > ov["written"]:
                         return st
                     continue
-                if st.get("rev") == ov["rev"]:
+                if st.get("rev") == ov["rev"] and (not complete or st.get("complete", True)):
                     return st
             time.sleep(0.5 if self.remote else 0.05)
         return None

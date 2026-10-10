@@ -21,6 +21,7 @@ LAST_SENT = {}       # batch name -> signature of the last document sent (skip i
 LIVE = False
 LAST_ERROR = ""
 RECEIPT_WAIT = 5.0   # seconds the worker waits for UE's receipt before moving on
+MESH_WAIT = 300.0    # then, if UE is still importing new meshes (#28), how long it waits for the complete receipt
 
 
 def settings(context=None):

@@ -42,11 +42,17 @@ class RENOU_PT_sync(bpy.types.Panel):
                 box.label(text=f"UE 回执：{'%.2f s' % lat if lat is not None else '未收到'}，{age} 秒前，{r.get('label', '')}")
             c = ue.get("counts") or {}
             if c:
-                names = (("moved", "挪"), ("added", "新增"), ("hidden", "隐藏"), ("swapped", "换件"))
+                names = (("moved", "挪"), ("added", "新增"), ("hidden", "隐藏"), ("swapped", "换件"),
+                         ("waiting_mesh", "等网格"))
                 box.label(text="这一版改动：" + " · ".join(f"{t} {c[k]}" for k, t in names if c.get(k)))
             ms = ue.get("meshes") or []
             if ms:
-                box.label(text=f"重导网格 {len(ms)} 个，UE 用时 {sum(m.get('seconds', 0) for m in ms):.1f} s", icon="MESH_DATA")
+                sec = sum(m.get("seconds", m.get("import_s", 0)) for m in ms)
+                box.label(text=f"重导网格 {len(ms)} 个，UE 用时 {sec:.1f} s", icon="MESH_DATA")
+            pend = ue.get("pending_meshes") or []
+            if pend:
+                box.label(text=f"UE 后台导入新网格 {len(pend)} 个（位置已生效，导完自动换上）：" +
+                          "，".join(pend[:4]) + ("…" if len(pend) > 4 else ""), icon="TIME")
             if ue.get("save_guard"):
                 box.label(text="UE 批次层只读中（预览和正式表不同，存盘不会混进预览）", icon="LOCKED")
             conflicts = ue.get("conflicts") or []
