@@ -48,6 +48,24 @@ def glb_part_bounds(path):
     return out
 
 
+# renou-placements/1 optional row fields (协调 10-10, 程序化布景调研 §4.9 / §7.2): every reader ignores what it does not
+# know, so old tables and old readers keep working. layer L1-L5 / HERO, recipe, group (cluster / vignette id), pair (the
+# other era's id), event (ageing event id), lock ("hand" / true: a regeneration keeps this row; "proc" / false / absent:
+# the generator may replace it), tags (list: clutter, helper, nocol ...). Carried through Blender untouched.
+OPTIONAL_FIELDS = ("layer", "recipe", "group", "pair", "event", "lock", "tags")
+
+
+def optional_fields(rec):
+    """the optional fields a row carries (dict, possibly empty)."""
+    return {k: rec[k] for k in OPTIONAL_FIELDS if k in rec}
+
+
+def is_locked(rec):
+    """True for lock = "hand" or true (a regeneration must keep the row as it is)."""
+    v = rec.get("lock")
+    return v is True or (isinstance(v, str) and v.lower() in ("hand", "true", "yes", "1"))
+
+
 ARCHIVE_KEEP = 50    # snapshots kept per override file (user 10-10: at least 20)
 
 
@@ -293,10 +311,40 @@ class Batch:
         o = bpy.data.objects.new(iid, self.meshes.get(rec["part"]))
         o["blsync_id"], o["blsync_part"] = iid, rec["part"]
         o["blsync_era"], o["blsync_src"] = rec.get("era", "both"), rec.get("src", "")
+        meta = optional_fields(rec)
+        if meta:                             # one JSON string: Blender ID properties hold no string lists (tags)
+            o["blsync_meta"] = json.dumps(meta, ensure_ascii=False)
         o.matrix_world = mat_of(rec)
         self.col.objects.link(o)
         self.obj[iid] = o
         return o
+
+    @staticmethod
+    def meta(o):
+        """the optional placements fields an object carries (a Shift+D copy carries its source's)."""
+        try:
+            return json.loads(o.get("blsync_meta") or "{}")
+        except Exception:
+            return {}
+
+    def where(self, **want):
+        """objects whose row's optional fields match, e.g. where(layer="L3"), where(group="g012"), where(tags="clutter")
+        (a tag matches when the row's tags list holds it), where(lock="hand")."""
+        out = []
+        for o in self.col.objects:
+            m = self.meta(o)
+            ok = True
+            for k, v in want.items():
+                have = m.get(k)
+                if k == "tags":
+                    ok &= v in (have or [])
+                elif k == "lock":
+                    ok &= (is_locked(m) == is_locked({"lock": v}))
+                else:
+                    ok &= have == v
+            if ok:
+                out.append(o)
+        return out
 
     def batch_of(self, iid):
         """True when an id belongs to this batch (table ids and the <batch>_bl… ids made here)."""
@@ -304,9 +352,10 @@ class Batch:
 
     # ---- selection helpers
     def group(self, key):
-        """objects whose building_id == key, or whose src (part before ' | ') == key."""
+        """objects whose building_id == key, whose src (part before ' | ') == key, or whose optional group == key."""
         out = [o for iid, o in self.obj.items()
-               if self.base[iid].get("building_id") == key or self.base[iid].get("src", "").split(" | ")[0].strip() == key]
+               if self.base[iid].get("building_id") == key or self.base[iid].get("src", "").split(" | ")[0].strip() == key
+               or self.base[iid].get("group") == key]
         assert out, f"no instances for {key!r} in {self.batch}"
         return out
 
@@ -756,8 +805,10 @@ class Batch:
         host, _ = self._split()
         return subprocess.run(["ssh", host, f"cat '{self.status.as_posix()}'"], capture_output=True, text=True, timeout=15).stdout
 
-    def write_back(self, out_dir):
-        """new placements version (never overwrites): <batch>_placements_v<NNN>.json + <batch>_changes_v<NNN>.md."""
+    def write_back(self, out_dir, lock_edits=True):
+        """new placements version (never overwrites): <batch>_placements_v<NNN>.json + <batch>_changes_v<NNN>.md.
+        Rows keep every field they had, known or not (optional fields, fields a newer generator adds). lock_edits: rows
+        moved, swapped or added here get lock = "hand", so a regeneration keeps them (程序化布景调研 §4.9)."""
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         n = 1
@@ -774,6 +825,8 @@ class Batch:
                 log["deleted"].append(rec)
                 continue
             r = dict(rec)
+            if lock_edits:
+                r["lock"] = "hand"
             q = Quaternion(e["quat_wxyz"])
             r.update(pos=e["pos"], quat_wxyz=e["quat_wxyz"], yaw_deg=round(math.degrees(q.to_euler("XYZ").z), 3),
                      scale=e["scale"][0] if max(e["scale"]) - min(e["scale"]) < 1e-6 else e["scale"])
@@ -793,6 +846,12 @@ class Batch:
                  "scale": e["scale"][0] if max(e["scale"]) - min(e["scale"]) < 1e-6 else e["scale"],
                  "district": src_rec.get("district", self.batch), "zone": src_rec.get("zone", ""), "era": e.get("era", "both"),
                  "building_id": src_rec.get("building_id", ""), "src": e.get("src", "")}
+            o = next((x for x in self.col.objects if x.get("blsync_id") == iid), None)
+            inherit = optional_fields(self.meta(o)) if o is not None else {}
+            inherit.pop("pair", None)        # the other era's twin belongs to the source, not to a copy
+            r.update(inherit)                # a copy keeps its source's layer, recipe, group, event, tags
+            if lock_edits:
+                r["lock"] = "hand"
             rows.append(r)
             log["added"].append(r)
         new = dict(self.data, instances=rows, count=len(rows),

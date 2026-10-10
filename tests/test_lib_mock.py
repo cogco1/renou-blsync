@@ -347,6 +347,41 @@ try:
         check("load_overrides: refuses a document of another table version", True)
     S2.publish("snapshot test done", wait=0)
 
+    # 10-10: optional placements fields (layer, recipe, group, pair, event, lock, tags) and unknown fields pass through
+    F3 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
+    b5 = F3.where(layer="L3")
+    check("optional fields: where(layer=...) finds the 4 rows that carry it", len(b5) == 4, len(b5))
+    check("optional fields: group() also matches the group field", set(F3.group("g012")) == set(b5))
+    check("optional fields: where(tags=...) matches one tag of the list, where(lock=...) reads proc / hand",
+          set(F3.where(tags="nocol")) == set(b5) and not F3.where(lock="hand") and set(F3.where(lock="proc")) >= set(b5))
+    want_meta = {"layer": "L3", "recipe": "F_QUAY_LOAD", "group": "g012", "event": "E-H3-1", "lock": "proc",
+                 "tags": ["clutter", "nocol"]}
+    m0 = F3.meta(b5[0])
+    check("optional fields: carried on the object", {k: m0.get(k) for k in want_meta} == want_meta and m0["pair"].startswith("past_"), m0)
+    check("optional fields: is_locked reads hand / true / proc",
+          rb.is_locked({"lock": "hand"}) and rb.is_locked({"lock": True}) and not rb.is_locked({"lock": "proc"})
+          and not rb.is_locked({}))
+    F3.move(b5[:1], (2.0, 0.0, 0.0))
+    cp = F3.copy(b5[1:2], (0.0, 40.0, 0.0))[0]
+    wb = F3.write_back(out / "fields_wb")
+    tab = json.loads(Path(wb["placements"]).read_text(encoding="utf-8"))
+    rows = {r["id"]: r for r in tab["instances"]}
+    base_rows = {r["id"]: r for r in json.loads(P.read_text(encoding="utf-8"))["instances"]}
+    moved = rows[b5[0]["blsync_id"]]
+    check("write_back: a moved row keeps every optional field and gets lock = hand",
+          {k: moved.get(k) for k in want_meta if k != "lock"} == {k: v for k, v in want_meta.items() if k != "lock"}
+          and moved["lock"] == "hand" and moved["pair"] == base_rows[b5[0]["blsync_id"]]["pair"], moved)
+    added = rows[cp["blsync_id"]]
+    check("write_back: a copy keeps its source's layer / group / tags (not its pair) and gets lock = hand",
+          added.get("layer") == "L3" and added.get("group") == "g012" and added.get("tags") == ["clutter", "nocol"]
+          and added.get("lock") == "hand" and "pair" not in added, added)
+    fut = next(r for r in base_rows.values() if "x_future" in r)
+    check("write_back: untouched rows stay identical, unknown fields included",
+          rows[fut["id"]] == fut and rows[b5[2]["blsync_id"]] == base_rows[b5[2]["blsync_id"]])
+    wb2 = F3.write_back(out / "fields_wb", lock_edits=False)
+    check("write_back(lock_edits=False) leaves lock as it was",
+          {r["id"]: r for r in json.loads(Path(wb2["placements"]).read_text(encoding="utf-8"))["instances"]}[b5[0]["blsync_id"]]["lock"] == "proc")
+
     # Remote mode uses the real subprocess-based transport, but PATH can only
     # reach these local stand-ins. All data is synthetic; no server is involved.
     original_path = os.environ.get("PATH")

@@ -34,7 +34,7 @@
 
 | 格式 | 谁写 | 谁读 | 要点 |
 |---|---|---|---|
-| `renou-placements/1` 摆放表 | 工程（正式发布） | 函数库、UE | 每个实例有稳定的 `id`；Blender 世界坐标，米，Z 朝上，四元数 wxyz |
+| `renou-placements/1` 摆放表 | 工程（正式发布） | 函数库、UE | 每个实例有稳定的 `id`；Blender 世界坐标，米，Z 朝上，四元数 wxyz。可选字段 layer / recipe / group / pair / event / lock / tags 见 [摆放表可选字段.md](摆放表可选字段.md)，未知字段一律忽略 |
 | `renou-overrides/1` 覆盖文件 | 函数库 | UE | **累计**：和摆放表不同的全部列出，改回原样的去掉；原子写入；`rev` 只增不减 |
 | 单件 GLB `<part>_<sha8>.glb` | 函数库 | UE | 只含一个件，单位矩阵，glTF Y 朝上；文件名带内容哈希，同一份不重导 |
 | `status.json` 回执 | UE（测试时用假接收器） | 函数库 / 插件 | `rev`、`latency_s`、`counts`、`errors` |

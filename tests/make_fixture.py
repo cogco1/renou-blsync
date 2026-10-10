@@ -86,6 +86,11 @@ def placements():
             rows.append({"id": f"{BATCH}_{n:06d}", "part": part, "lods": ["NEAR"], "pos": [ox + dx, oy + dy, dz],
                          "quat_wxyz": quat_z(yaw), "yaw_deg": yaw, "scale": 1.0, "district": BATCH, "zone": "test",
                          "era": "both", "building_id": f"BLD_{b:02d}", "src": f"BLD_{b:02d} | synthetic"})
+            if b == 5:                               # 10-10: the optional row fields (程序化布景调研 §4.9)
+                rows[-1].update(layer="L3", recipe="F_QUAY_LOAD", group="g012", pair=f"past_{n:06d}", event="E-H3-1",
+                                lock="proc", tags=["clutter", "nocol"])
+            if b == 6 and part == "PBOX_A":          # a field no reader knows yet: ignored, and kept by write_back
+                rows[-1]["x_future"] = {"note": "unknown to every reader"}
     n += 1
     rows.append({"id": f"{BATCH}_{n:06d}", "part": "PBAKED_BLK1", "lods": ["NEAR"], "pos": [0.0, 0.0, 0.0],
                  "quat_wxyz": [1.0, 0.0, 0.0, 0.0], "yaw_deg": 0.0, "scale": 1.0, "district": BATCH, "zone": "test",
