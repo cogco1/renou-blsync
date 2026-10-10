@@ -506,11 +506,13 @@ class Batch:
             if want and got != want:
                 out.setdefault("errors", []).append(f"mesh {part}: sha {got[:12]} != {want[:12]} (file still being written?)")
                 continue
-            folder = f"{LIVE_ROOT}/{self.name}/{part}_{got[:8]}"     # R3: preview assets apart, never in a batch folder
             gm = glb_materials(glb)
             textured = {_norm(n) for n, tex in gm.items() if tex}
             self.textured_now = textured
             need_mats = self.needs_glb_materials(list(gm), self.meshes.get(part.lower()))
+            # R3: preview assets apart, never in a batch folder. One folder per part, GLB content and material choice,
+            # shared by every batch: the north slope (10-10) sent the same part to three batches, imported three times
+            folder = f"{LIVE_ROOT}/_parts/{part}_{got[:8]}{'_m' if need_mats else ''}"
             job = {"folder": folder, "sha": got, "textured": textured, "need_mats": need_mats}
             rec = _ASYNC.get(folder)
             if rec is not None and rec["state"] == "failed":
