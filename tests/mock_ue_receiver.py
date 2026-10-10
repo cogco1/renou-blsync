@@ -73,7 +73,7 @@ while True:
                  "swapped" if (e or {}).get("part") != (prev.get(iid) or {}).get("part") else "moved")
             counts[k] = counts.get(k, 0) + 1
         prev = new
-        out = {"rev": ov.get("rev"), "written": ov.get("written"), "counts": counts, "overrides": len(new),
+        out = {"batch": ov.get("batch"), "rev": ov.get("rev"), "written": ov.get("written"), "counts": counts, "overrides": len(new),
                "errors": check(ov) or None, "seconds": round(time.time() - t0, 4), "applied_at": time.time()}
         if ov.get("written"):
             out["latency_s"] = round(out["applied_at"] - float(ov["written"]), 3)

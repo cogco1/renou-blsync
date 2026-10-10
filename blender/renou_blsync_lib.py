@@ -497,17 +497,35 @@ class Batch:
         return res
 
     def wait_receipt(self, ov, wait=30.0):
-        """any thread: UE's status.json for this rev (or an error newer than the file), or None after `wait` s."""
+        """any thread: UE's receipt for this rev (or an error newer than the file), or None after `wait` s.
+        bl_sync writes one receipt per batch (status_<batch>.json) besides the shared status.json: the batch's own
+        file is read first, so two writers on two batches never pick up each other's receipt."""
         t0 = time.time()
         while wait and time.time() - t0 < wait:
-            try:
-                st = json.loads(self._read_status())
-            except Exception:
-                st = {}
-            if st.get("rev") == ov["rev"] or (st.get("error") and st.get("t", 0) > ov["written"]):
-                return st
+            for own, text in self._read_statuses():
+                try:
+                    st = json.loads(text)
+                except Exception:
+                    continue
+                if not self.receipt_is_mine(st, own):
+                    continue
+                if st.get("error"):
+                    if st.get("t", 0) > ov["written"]:
+                        return st
+                    continue
+                if st.get("rev") == ov["rev"]:
+                    return st
             time.sleep(0.5 if self.remote else 0.05)
         return None
+
+    def receipt_is_mine(self, st, own):
+        """Ash 10-10: a rev alone is no identity (two batches started in the same second share it). A receipt that
+        names its batch must name this one; one that names none (bl_sync before 10-10) is believed only from the
+        batch's own status_<batch>.json, never from the shared status.json."""
+        b = st.get("batch")
+        if b is not None:
+            return b == self.batch
+        return own
 
     # ---- R7: laptop -> server with the system's scp / ssh
     def _split(self):
@@ -533,6 +551,30 @@ class Batch:
                 subprocess.run(["scp", "-q", m["glb"], f"{host}:{rpath}"], check=True)
                 self._pushed.add((part, m["sha256"]))
             out[part] = {"glb": rpath, "sha256": m["sha256"]}
+        return out
+
+    def _status_paths(self):
+        own = self.status.with_name(f"status_{self.batch}.json")
+        return [own, self.status] if self.status.name == "status.json" else [self.status]
+
+    def _read_statuses(self):
+        """[(own, text)] of the receipt files, the batch's own first (own = status_<batch>.json); missing files are
+        skipped."""
+        own_name = f"status_{self.batch}.json"
+        if not self.remote:
+            out = []
+            for p in self._status_paths():
+                try:
+                    out.append((p.name == own_name, p.read_text(encoding="utf-8")))
+                except OSError:
+                    pass
+            return out
+        host, _ = self._split()
+        out = []
+        for p in self._status_paths():           # one plain `cat` per file (a missing file just fails)
+            r = subprocess.run(["ssh", host, f"cat '{p.as_posix()}'"], capture_output=True, text=True, timeout=15)
+            if r.returncode == 0 and r.stdout.strip():
+                out.append((p.name == own_name, r.stdout))
         return out
 
     def _read_status(self):
