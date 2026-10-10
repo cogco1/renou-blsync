@@ -350,15 +350,18 @@ class Batch:
     def needs_glb_materials(self, names, old_mesh):
         """True when some slot of the new mesh would end on "keep" (KEEP_GLB) with nothing in UE to show for it."""
         old = {_norm(n) for n in slot_names(old_mesh)} if old_mesh else set()
-        for n in names:
-            k = _norm(n)
-            if k in old:
-                continue
-            m, how = self.ue_material(n)
-            if how in ("keep", "keep_textured"):
-                return True
-        self.unmapped -= {n for n in names}         # ue_material() above only looked; the real assignment reports again
-        return False
+        seen = set(self.unmapped)                   # ue_material() below only looks: what it adds is taken back, and
+        try:                                        # nothing reported for other meshes is dropped (Ash 10-10)
+            for n in names:
+                k = _norm(n)
+                if k in old:
+                    continue
+                m, how = self.ue_material(n)
+                if how in ("keep", "keep_textured"):
+                    return True
+            return False
+        finally:
+            self.unmapped = seen
 
     def carry_materials(self, comp, old_mesh, new_mesh):
         """switch comp to new_mesh; a slot with the same name as on the old mesh keeps exactly the material UE showed
@@ -367,9 +370,12 @@ class Batch:
         self.textured_now = getattr(self, "textured_by_mesh", {}).get(new_mesh.get_path_name(), set())
         comp.set_static_mesh(new_mesh)
         rep = {}
+        ph = PLACEHOLDER.split(".")[0]
         for j, n in enumerate(slot_names(new_mesh)):
             m = before.get(_norm(n))
             how = "carried"
+            if m is not None and m.get_path_name().split(".")[0] == ph:
+                m = None                            # a placeholder is not UE's material: resolve again, report if still none
             if m is None:
                 m, how = self.ue_material(n)
             if m is not None:
@@ -965,16 +971,29 @@ def apply_file(path, name=None):
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
     out = b.apply(ov)
+    out["batch"] = ov.get("batch") or b.name      # Ash 10-10: every receipt says whose it is (rev alone can collide)
+    out["file"] = str(path)
     out["applied_at"] = time.time()
     if out.get("written"):
         out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)
-    body = json.dumps(out, ensure_ascii=False)
-    (CTRL / "status.tmp").write_text(body, encoding="utf-8")
-    (CTRL / "status.tmp").replace(CTRL / "status.json")      # the last receipt of any batch (kept for old readers)
-    one = CTRL / f"status_{ov.get('batch') or b.name}.json"   # one receipt per batch: two writers never mix receipts
-    one.with_suffix(".tmp").write_text(body, encoding="utf-8")
-    one.with_suffix(".tmp").replace(one)
+    write_receipt(out["batch"], out)
     return out
+
+
+def write_receipt(batch, body):
+    """status_<batch>.json (the batch's own receipt) and status.json (the last receipt of any batch, for old readers);
+    both carry "batch", so a reader can check it is reading its own."""
+    text = json.dumps(dict(body, batch=batch), ensure_ascii=False)
+    for f in ([CTRL / f"status_{batch}.json"] if batch else []) + [CTRL / "status.json"]:
+        f.with_suffix(".tmp").write_text(text, encoding="utf-8")
+        f.with_suffix(".tmp").replace(f)
+
+
+def _file_batch(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8-sig")).get("batch")
+    except Exception:
+        return None
 
 
 def _sig(path):
@@ -1001,7 +1020,7 @@ def _watch_tick(dt):
         except Exception:
             err = traceback.format_exc()
             unreal.log_error("[BLSYNC] " + err)
-            (CTRL / "status.json").write_text(json.dumps({"error": err, "file": path, "t": time.time()}), encoding="utf-8")
+            write_receipt(_file_batch(path), {"error": err, "file": path, "t": time.time()})
         finally:
             S["busy"] = False
         # the file read is the one applied; if it changed meanwhile, the next tick sees a new signature and applies it

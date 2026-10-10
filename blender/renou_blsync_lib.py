@@ -66,9 +66,25 @@ def canon(q):
     return q
 
 
-def same_rotation(a, b, eps=1e-9):
-    """True when two unit quaternions are the same rotation, whatever their signs (|a.b| = cos of half the angle)."""
-    return abs(a.normalized().dot(b.normalized())) > 1.0 - eps   # table quaternions carry 7 decimals: not exactly unit
+ROT_TOL = 1e-5      # radians (0.00057 deg, 1 mm at 100 m). Blender 5.2.2, 10,000 random rotations: a float32 matrix round
+                    # trip differs by at most 7.4e-7 rad, 7-decimal table quaternions by 1.8e-7; a 0.01 deg edit is 1.7e-4
+
+
+def rotation_angle(a, b):
+    """angle in radians between the rotations of two quaternions (wxyz, any sign, any length), in double precision.
+    The chord |a - s b| (s = sign of a.b) is 2 sin(angle / 4): no cancellation near 1, unlike 1 - |a.b|."""
+    a, b = [float(x) for x in a], [float(x) for x in b]
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(x * x for x in b))
+    a, b = [x / na for x in a], [x / nb for x in b]
+    s = 1.0 if sum(x * y for x, y in zip(a, b)) >= 0.0 else -1.0
+    chord = math.sqrt(sum((x - s * y) ** 2 for x, y in zip(a, b)))
+    return 4.0 * math.asin(min(1.0, chord / 2.0))
+
+
+def same_rotation(a, b, tol=ROT_TOL):
+    """True when two quaternions are the same rotation within tol radians, whatever their signs (#31). Ash 10-10: the
+    float32 |a.b| > 1 - 1e-9 test called 190 of 10,000 identical rotations different."""
+    return rotation_angle(a, b) <= tol
 
 
 def decompose(m):
@@ -486,15 +502,30 @@ class Batch:
         file is read first, so two writers on two batches never pick up each other's receipt."""
         t0 = time.time()
         while wait and time.time() - t0 < wait:
-            for text in self._read_statuses():
+            for own, text in self._read_statuses():
                 try:
                     st = json.loads(text)
                 except Exception:
                     continue
-                if st.get("rev") == ov["rev"] or (st.get("error") and st.get("t", 0) > ov["written"]):
+                if not self.receipt_is_mine(st, own):
+                    continue
+                if st.get("error"):
+                    if st.get("t", 0) > ov["written"]:
+                        return st
+                    continue
+                if st.get("rev") == ov["rev"]:
                     return st
             time.sleep(0.5 if self.remote else 0.05)
         return None
+
+    def receipt_is_mine(self, st, own):
+        """Ash 10-10: a rev alone is no identity (two batches started in the same second share it). A receipt that
+        names its batch must name this one; one that names none (bl_sync before 10-10) is believed only from the
+        batch's own status_<batch>.json, never from the shared status.json."""
+        b = st.get("batch")
+        if b is not None:
+            return b == self.batch
+        return own
 
     # ---- R7: laptop -> server with the system's scp / ssh
     def _split(self):
@@ -527,12 +558,14 @@ class Batch:
         return [own, self.status] if self.status.name == "status.json" else [self.status]
 
     def _read_statuses(self):
-        """the receipt files' texts, the batch's own first; missing files are skipped."""
+        """[(own, text)] of the receipt files, the batch's own first (own = status_<batch>.json); missing files are
+        skipped."""
+        own_name = f"status_{self.batch}.json"
         if not self.remote:
             out = []
             for p in self._status_paths():
                 try:
-                    out.append(p.read_text(encoding="utf-8"))
+                    out.append((p.name == own_name, p.read_text(encoding="utf-8")))
                 except OSError:
                     pass
             return out
@@ -541,7 +574,7 @@ class Batch:
         for p in self._status_paths():           # one plain `cat` per file (a missing file just fails)
             r = subprocess.run(["ssh", host, f"cat '{p.as_posix()}'"], capture_output=True, text=True, timeout=15)
             if r.returncode == 0 and r.stdout.strip():
-                out.append(r.stdout)
+                out.append((p.name == own_name, r.stdout))
         return out
 
     def _read_status(self):
