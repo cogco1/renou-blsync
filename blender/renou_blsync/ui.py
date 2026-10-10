@@ -67,6 +67,14 @@ class RENOU_PT_sync(bpy.types.Panel):
                 sub = box.box()
                 sub.label(text=f"材质槽 UE 没映射 {len(unmapped)} 个（显示斑马纹，请视效补表）：", icon="MATERIAL")
                 sub.label(text="，".join(unmapped[:6]) + ("…" if len(unmapped) > 6 else ""))
+            if name in state.BLOCKED:
+                sub = box.box()
+                sub.alert = True
+                sub.label(text=f"这一批暂不发布：{state.BLOCKED[name][:120]}", icon="ERROR")
+                row = sub.row(align=True)
+                op = row.operator("renou.restore_snapshot", text="重试载回覆盖文件", icon="FILE_REFRESH")
+                op.batch, op.path = name, str(B.out)
+                row.operator("renou.unblock", text="从正式表开始", icon="LOOP_BACK").batch = name
             snaps = state.snapshots(name)
             if snaps:
                 sub = box.box()

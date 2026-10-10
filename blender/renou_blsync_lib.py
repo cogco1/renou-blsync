@@ -84,14 +84,12 @@ def replace_risk(old, new):
     return None
 
 
-def snapshot_file(path, reason, archive=None, keep=ARCHIVE_KEEP):
-    """copy an override file into archive/ as <stem>__<yyyymmdd-hhmmss-mmm>__rev<rev>__<reason>.json before something
-    replaces it. A copy identical to the newest snapshot is not made again (bl_sync in UE may snapshot the same bytes);
-    the newest `keep` snapshots of the file are kept. Returns the snapshot's path (None: no file to keep)."""
-    p = Path(path)
-    if not p.exists():
-        return None
-    raw = p.read_bytes()
+def snapshot_bytes(out, raw, reason, archive=None, keep=ARCHIVE_KEEP):
+    """keep `raw` (an override document's bytes) in archive/ as <stem>__<yyyymmdd-hhmmss-mmm>__rev<rev>__<reason>__
+    <sha8>.json; <stem> is the override file's. Ash 10-10: the content's SHA in the name and an exclusive create, so two
+    different contents never share a name, and the copy is read back before it counts. Same as the newest snapshot:
+    not made again. The newest `keep` stay. Raises OSError when it cannot be kept - callers then change nothing."""
+    p = Path(out)
     d = Path(archive) if archive else archive_dir(p)
     d.mkdir(parents=True, exist_ok=True)
     olds = sorted(d.glob(f"{p.stem}__*.json"))
@@ -104,13 +102,26 @@ def snapshot_file(path, reason, archive=None, keep=ARCHIVE_KEEP):
     t = time.time()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(t)) + f"-{int(t * 1000) % 1000:03d}"
     why = re.sub(r"[^0-9A-Za-z_-]+", "-", str(reason or "replaced"))[:40]
-    snap = d / f"{p.stem}__{stamp}__rev{rev}__{why}.json"
-    tmp = snap.with_suffix(".tmp")
-    tmp.write_bytes(raw)
-    os.replace(tmp, snap)
+    snap = d / f"{p.stem}__{stamp}__rev{rev}__{why}__{hashlib.sha256(raw).hexdigest()[:8]}.json"
+    if snap.exists():
+        if snap.read_bytes() == raw:
+            return snap
+        raise OSError(f"{snap.name} exists with other bytes")
+    with open(snap, "xb") as fh:         # exclusive: never replaces an existing snapshot
+        fh.write(raw)
+    if snap.read_bytes() != raw:
+        raise OSError(f"{snap.name}: read back differs")
     for old in sorted(d.glob(f"{p.stem}__*.json"))[:-keep]:
         old.unlink()                     # rotation of the tool's own copies (the newest `keep` stay)
     return snap
+
+
+def snapshot_file(path, reason, archive=None, keep=ARCHIVE_KEEP):
+    """copy an override file into archive/ before something replaces it (see snapshot_bytes). None: no file to keep."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    return snapshot_bytes(p, p.read_bytes(), reason, archive, keep)
 
 
 def list_snapshots(out, archive=None, limit=20):
@@ -149,9 +160,25 @@ def canon(q):
     return q
 
 
-def same_rotation(a, b, eps=1e-9):
-    """True when two unit quaternions are the same rotation, whatever their signs (|a.b| = cos of half the angle)."""
-    return abs(a.normalized().dot(b.normalized())) > 1.0 - eps   # table quaternions carry 7 decimals: not exactly unit
+ROT_TOL = 1e-5      # radians (0.00057 deg, 1 mm at 100 m). Blender 5.2.2, 10,000 random rotations: a float32 matrix round
+                    # trip differs by at most 7.4e-7 rad, 7-decimal table quaternions by 1.8e-7; a 0.01 deg edit is 1.7e-4
+
+
+def rotation_angle(a, b):
+    """angle in radians between the rotations of two quaternions (wxyz, any sign, any length), in double precision.
+    The chord |a - s b| (s = sign of a.b) is 2 sin(angle / 4): no cancellation near 1, unlike 1 - |a.b|."""
+    a, b = [float(x) for x in a], [float(x) for x in b]
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(x * x for x in b))
+    a, b = [x / na for x in a], [x / nb for x in b]
+    s = 1.0 if sum(x * y for x, y in zip(a, b)) >= 0.0 else -1.0
+    chord = math.sqrt(sum((x - s * y) ** 2 for x, y in zip(a, b)))
+    return 4.0 * math.asin(min(1.0, chord / 2.0))
+
+
+def same_rotation(a, b, tol=ROT_TOL):
+    """True when two quaternions are the same rotation within tol radians, whatever their signs (#31). Ash 10-10: the
+    float32 |a.b| > 1 - 1e-9 test called 190 of 10,000 identical rotations different."""
+    return rotation_angle(a, b) <= tol
 
 
 def decompose(m):
@@ -559,27 +586,39 @@ class Batch:
         """put the scene into the state an override document describes - a snapshot from archive/, or the file already
         in `out` when the add-on attaches again (user 10-10: reopening a window must not start from an empty file).
         Everything goes back to the table first, then each listed instance is placed as listed; part meshes come from
-        the document's GLBs. Returns {"instances", "meshes", "missing_meshes"}. Main thread, object mode."""
+        the document's GLBs. Ash 10-10, all or nothing: the document, every GLB (present - as written or in <out>/meshes -,
+        its SHA-256 equal to the document's, importable) is checked and imported BEFORE the scene changes; anything wrong
+        raises and leaves the scene as it was. Returns {"instances", "meshes", "missing_meshes": []}. Main thread."""
         doc = src if isinstance(src, dict) else json.loads(Path(src).read_text(encoding="utf-8-sig"))
         if doc.get("schema") != "renou-overrides/1" or doc.get("batch") != self.batch:
             raise ValueError(f"not an override document of {self.batch}: {doc.get('schema')} / {doc.get('batch')}")
         if doc.get("base_sha256") and doc["base_sha256"] != self.base_sha:
             raise ValueError("the document was made against another version of the placements table")
+        staged = {}
+        try:
+            for part, m in (doc.get("meshes") or {}).items():
+                glb = self._local_glb(m["glb"])
+                if glb is None:
+                    raise FileNotFoundError(f"mesh {part}: {m['glb']} not found (nor in {self.out.parent / 'meshes'})")
+                got = hashlib.sha256(glb.read_bytes()).hexdigest()
+                if m.get("sha256") and got != m["sha256"]:
+                    raise ValueError(f"mesh {part}: {glb.name} has SHA-256 {got[:12]}, the document says {m['sha256'][:12]}")
+                staged[part] = (glb, got, self._import_part_mesh(glb, part + "__staged"))
+        except Exception:
+            for _glb, _got, me in staged.values():
+                bpy.data.meshes.remove(me)
+            raise
+        # from here on nothing reads a file: the scene changes as a whole
         self.reset()
         table_parts = {r["part"] for r in self.base.values()}
-        missing = []
-        for part, m in (doc.get("meshes") or {}).items():
-            glb = self._local_glb(m["glb"])
-            if glb is None:
-                missing.append(part)
-                continue
-            me = self._import_part_mesh(glb, part)
+        for part, (glb, got, me) in staged.items():
+            me.name = part
             if part in self.meshes and part not in self._orig_mesh:
                 self._orig_mesh[part] = self.meshes[part]
             self.meshes[part] = me
             if part not in table_parts:
                 self._slot_only_parts.add(part)          # new parts export slot names only, as add_object made them
-            self.mesh_out[part] = {"glb": str(glb), "sha256": m.get("sha256") or hashlib.sha256(glb.read_bytes()).hexdigest()}
+            self.mesh_out[part] = {"glb": str(glb), "sha256": got}
             if self._sig:
                 self._sig[part] = mesh_sig(me)
         for o in self.col.objects:                       # table objects of a replaced part show the loaded mesh
@@ -610,7 +649,19 @@ class Batch:
             pass
         bpy.context.view_layer.update()
         return {"instances": len(doc.get("instances") or {}), "meshes": len(doc.get("meshes") or {}),
-                "missing_meshes": missing}
+                "missing_meshes": []}
+
+    def snapshot_scene(self, reason="scene"):
+        """keep the scene's current state (unpublished edits included) in archive/ as an override document - before a
+        restore replaces it (Ash 10-10: the file on disk may not hold the newest edits). Part meshes edited but not yet
+        exported are not in it (their GLBs do not exist yet)."""
+        doc = {"schema": "renou-overrides/1", "batch": self.batch, "base_sha256": self.base_sha, "rev": self.rev,
+               "label": f"scene before {reason} (unpublished edits included)", "written": time.time(),
+               "instances": self.overrides(),
+               "meshes": {p: {"glb": m["glb"], "sha256": m["sha256"]} for p, m in self.mesh_out.items()}}
+        snap = snapshot_bytes(self.out, json.dumps(doc, ensure_ascii=False).encode("utf-8"), reason, self.archive)
+        self.last_snapshot = str(snap)
+        return snap
 
     # ---- output
     def overrides(self):
@@ -690,17 +741,30 @@ class Batch:
         follows when the meshes are in. complete=True waits for that one."""
         t0 = time.time()
         while wait and time.time() - t0 < wait:
-            for text in self._read_statuses():
+            for own, text in self._read_statuses():
                 try:
                     st = json.loads(text)
                 except Exception:
                     continue
-                if st.get("error") and st.get("t", 0) > ov["written"]:
-                    return st
+                if not self.receipt_is_mine(st, own):
+                    continue
+                if st.get("error"):
+                    if st.get("t", 0) > ov["written"]:
+                        return st
+                    continue
                 if st.get("rev") == ov["rev"] and (not complete or st.get("complete", True)):
                     return st
             time.sleep(0.5 if self.remote else 0.05)
         return None
+
+    def receipt_is_mine(self, st, own):
+        """Ash 10-10: a rev alone is no identity (two batches started in the same second share it). A receipt that
+        names its batch must name this one; one that names none (bl_sync before 10-10) is believed only from the
+        batch's own status_<batch>.json, never from the shared status.json."""
+        b = st.get("batch")
+        if b is not None:
+            return b == self.batch
+        return own
 
     # ---- R7: laptop -> server with the system's scp / ssh
     def _split(self):
@@ -733,12 +797,14 @@ class Batch:
         return [own, self.status] if self.status.name == "status.json" else [self.status]
 
     def _read_statuses(self):
-        """the receipt files' texts, the batch's own first; missing files are skipped."""
+        """[(own, text)] of the receipt files, the batch's own first (own = status_<batch>.json); missing files are
+        skipped."""
+        own_name = f"status_{self.batch}.json"
         if not self.remote:
             out = []
             for p in self._status_paths():
                 try:
-                    out.append(p.read_text(encoding="utf-8"))
+                    out.append((p.name == own_name, p.read_text(encoding="utf-8")))
                 except OSError:
                     pass
             return out
@@ -747,7 +813,7 @@ class Batch:
         for p in self._status_paths():           # one plain `cat` per file (a missing file just fails)
             r = subprocess.run(["ssh", host, f"cat '{p.as_posix()}'"], capture_output=True, text=True, timeout=15)
             if r.returncode == 0 and r.stdout.strip():
-                out.append(r.stdout)
+                out.append((p.name == own_name, r.stdout))
         return out
 
     def _read_status(self):

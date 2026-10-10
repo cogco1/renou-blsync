@@ -138,6 +138,35 @@ try:
     check("attach again: the next publish keeps every instance (no empty overwrite)",
           set(overrides()["instances"]) == before_ids and r.get("overrides") == len(before_ids), r.get("overrides"))
 
+    # Ash 10-10 on #37: a file that cannot be loaded back blocks publishing until the user decides
+    doc = overrides()
+    doc["meshes"]["PBOX_A"] = {"glb": str(out / "gone" / "PBOX_A_dead.glb"), "sha256": "0" * 64}
+    OV.write_text(json.dumps(doc), encoding="utf-8")
+    kept = OV.read_bytes()
+    check("attach with a file that cannot be loaded back", bpy.ops.renou.attach() == {"FINISHED"})
+    check("blocked: the batch is not published (not dirty, flush skips it), the file is untouched",
+          "test_01" in state.BLOCKED and live.flush("test") == [] and OV.read_bytes() == kept, state.BLOCKED)
+    n_snaps = len(state.rb.list_snapshots(OV, limit=200))
+    check("unblock operator (start from the table)", bpy.ops.renou.unblock(batch="test_01") == {"FINISHED"})
+    check("unblock only allows publishing: with the live switch off nothing goes out yet", OV.read_bytes() == kept)
+    bpy.ops.renou.publish_now()
+    r = settle()
+    check("unblock: published from the table; the file it replaced was kept first",
+          "test_01" not in state.BLOCKED and len(state.rb.list_snapshots(OV, limit=200)) == n_snaps + 1
+          and state.rb.list_snapshots(OV)[0]["instances"] == len(doc["instances"]), (r.get("overrides"), state.rb.list_snapshots(OV)[:1]))
+    B3 = state.BATCHES["test_01"]
+    B3.group("BLD_02")[0].location.x += 7.0              # an edit that was never published
+    bpy.context.view_layer.update()
+    state.DIRTY.discard("test_01")
+    target = state.rb.list_snapshots(OV, limit=200)[-1]["path"]
+    check("restore operator keeps the unpublished scene first", bpy.ops.renou.restore_snapshot(batch="test_01", path=target) == {"FINISHED"})
+    scene_snaps = [s for s in state.rb.list_snapshots(OV, limit=200)
+                   if "scene before" in json.loads(Path(s["path"]).read_text(encoding="utf-8")).get("label", "")]
+    check("restore: the scene with the unpublished edit is in archive/",
+          scene_snaps and any(k for k, v in json.loads(Path(scene_snaps[0]["path"]).read_text(encoding="utf-8"))["instances"].items()
+                              if B3.base.get(k, {}).get("building_id") == "BLD_02"), [s["path"] for s in scene_snaps[:1]])
+    settle()
+
     renou_blsync.unregister()
     check("unregister cleans up", not hasattr(bpy.types.Scene, "renou_sync") and not state.BATCHES
           and live.on_depsgraph not in bpy.app.handlers.depsgraph_update_post)
