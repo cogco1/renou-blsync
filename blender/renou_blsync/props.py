@@ -20,7 +20,8 @@ class RenouSyncSettings(bpy.types.PropertyGroup):
     out: StringProperty(name="覆盖文件", subtype="FILE_PATH",
                         description="<批>_overrides.json 写到哪；本机模式下是本地路径，再推到服务器同名目录")
     status: StringProperty(name="UE 回执", subtype="FILE_PATH",
-                           description="UE 写的 status.json；不填用函数库的默认路径")
+                           description="UE 写的回执 status.json；不填用函数库的默认路径。"
+                                       "实际先读同目录下这一批自己的 status_<批>.json，读不到再读 status.json")
     remote: StringProperty(name="服务器目录",
                            description="本机模式才填，例如 myserver:/path/to/data（只调用系统里已配好的 ssh/scp）")
     interval: FloatProperty(name="间隔 (s)", default=0.25, min=0.05, max=5.0,
