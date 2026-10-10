@@ -48,6 +48,100 @@ def glb_part_bounds(path):
     return out
 
 
+ARCHIVE_KEEP = 50    # snapshots kept per override file (user 10-10: at least 20)
+
+
+def archive_dir(out):
+    """where the snapshots of an override file go: archive/ next to it (bl_sync in UE uses the same folder)."""
+    return Path(out).parent / "archive"
+
+
+def replace_risk(old, new):
+    """why writing override document `new` over `old` could lose work, or None. User 10-10, after an edit got lost when
+    a window was reopened: cleared, instances or meshes leaving the file, most of it rewritten, the revision going back
+    or another table version all keep a copy of the old file first. bl_sync_core.replace_risk() is the same rule."""
+    if not old:
+        return None
+    oi, ni = old.get("instances") or {}, new.get("instances") or {}
+    if oi and not ni:
+        return "cleared"
+    if old.get("base_sha256") and new.get("base_sha256") and old["base_sha256"] != new["base_sha256"]:
+        return "base-changed"
+    try:
+        if float(new.get("rev")) < float(old.get("rev")):
+            return "rev-back"
+    except (TypeError, ValueError):
+        pass
+    gone = set(oi) - set(ni)
+    if gone:
+        return f"dropped{len(gone)}"
+    gm = set(old.get("meshes") or {}) - set(new.get("meshes") or {})
+    if gm:
+        return f"meshes-dropped{len(gm)}"
+    common = set(oi) & set(ni)
+    if len(common) >= 10 and sum(oi[k] != ni[k] for k in common) > len(common) / 2:
+        return "rewritten"
+    return None
+
+
+def snapshot_bytes(out, raw, reason, archive=None, keep=ARCHIVE_KEEP):
+    """keep `raw` (an override document's bytes) in archive/ as <stem>__<yyyymmdd-hhmmss-mmm>__rev<rev>__<reason>__
+    <sha8>.json; <stem> is the override file's. Ash 10-10: the content's SHA in the name and an exclusive create, so two
+    different contents never share a name, and the copy is read back before it counts. Same as the newest snapshot:
+    not made again. The newest `keep` stay. Raises OSError when it cannot be kept - callers then change nothing."""
+    p = Path(out)
+    d = Path(archive) if archive else archive_dir(p)
+    d.mkdir(parents=True, exist_ok=True)
+    olds = sorted(d.glob(f"{p.stem}__*.json"))
+    if olds and olds[-1].read_bytes() == raw:
+        return olds[-1]
+    try:
+        rev = json.loads(raw.decode("utf-8-sig")).get("rev")
+    except Exception:
+        rev = "unreadable"
+    t = time.time()
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(t)) + f"-{int(t * 1000) % 1000:03d}"
+    why = re.sub(r"[^0-9A-Za-z_-]+", "-", str(reason or "replaced"))[:40]
+    snap = d / f"{p.stem}__{stamp}__rev{rev}__{why}__{hashlib.sha256(raw).hexdigest()[:8]}.json"
+    if snap.exists():
+        if snap.read_bytes() == raw:
+            return snap
+        raise OSError(f"{snap.name} exists with other bytes")
+    with open(snap, "xb") as fh:         # exclusive: never replaces an existing snapshot
+        fh.write(raw)
+    if snap.read_bytes() != raw:
+        raise OSError(f"{snap.name}: read back differs")
+    for old in sorted(d.glob(f"{p.stem}__*.json"))[:-keep]:
+        old.unlink()                     # rotation of the tool's own copies (the newest `keep` stay)
+    return snap
+
+
+def snapshot_file(path, reason, archive=None, keep=ARCHIVE_KEEP):
+    """copy an override file into archive/ before something replaces it (see snapshot_bytes). None: no file to keep."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    return snapshot_bytes(p, p.read_bytes(), reason, archive, keep)
+
+
+def list_snapshots(out, archive=None, limit=20):
+    """newest first: [{"path", "time", "rev", "reason", "instances", "meshes"}] for one override file."""
+    p = Path(out)
+    d = Path(archive) if archive else archive_dir(p)
+    rows = []
+    for f in sorted(d.glob(f"{p.stem}__*.json"), reverse=True)[:limit]:
+        parts = f.stem.split("__")
+        row = {"path": str(f), "time": parts[1] if len(parts) > 1 else "", "rev": parts[2][3:] if len(parts) > 2 else "",
+               "reason": parts[3] if len(parts) > 3 else "", "instances": None, "meshes": None}
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8-sig"))
+            row.update(instances=len(doc.get("instances") or {}), meshes=len(doc.get("meshes") or {}))
+        except Exception:
+            pass
+        rows.append(row)
+    return rows
+
+
 def mat_of(rec):
     q = Quaternion(rec["quat_wxyz"]) if rec.get("quat_wxyz") else Quaternion((0, 0, 1), math.radians(rec.get("yaw_deg", 0.0)))
     s = rec.get("scale", 1.0)
@@ -139,13 +233,15 @@ def _slot_names_only(glb, names, part):
 
 class Batch:
     def __init__(self, placements, out, parts_glb=None, status=STATUS_DEFAULT, only_src=None, remote=None, load_meshes=True,
-                 track_edits=False):
+                 track_edits=False, archive=None):
         """only_src: optional regex on src; instances not matching are not loaded (they stay as in the table).
         remote (R7, Blender on a laptop): "myserver:/workspace/jobs/look-blsync-20261009-01/data" - out / meshes are written
         locally, then pushed with the system's own scp/ssh (keys already set up; nothing stored here); the receipt is read
         back over ssh. placements / parts_glb are local copies of the release files.
         track_edits (the add-on sets it): remember a signature of every part mesh, so export_part_if_changed() only exports
-        parts whose geometry really changed."""
+        parts whose geometry really changed.
+        archive: where snapshots of the override file go (default archive/ next to it). A Batch starts from the table; to
+        go on from the file already in `out` (or from a snapshot) call load_overrides()."""
         self.remote = remote
         self._pushed = set()                 # (part, sha256) already copied to the server (remote mode)
         self._sig = {}                       # part -> mesh signature at load / last export (track_edits)
@@ -164,13 +260,16 @@ class Batch:
         if parts_glb and not load_meshes:
             self.bounds = glb_part_bounds(parts_glb)
         elif parts_glb:
+            names = set(glb_part_bounds(parts_glb))      # the GLB's own node names = part ids
             before = set(bpy.data.objects)
             bpy.ops.import_scene.gltf(filepath=str(parts_glb))
             lib = bpy.data.collections.new("BLSYNC_PARTS|" + self.batch)
             bpy.context.scene.collection.children.link(lib)
             for o in set(bpy.data.objects) - before:
                 if o.type == "MESH":
-                    meshes[o.name] = o.data
+                    # a second load in the same Blender (the add-on attaching again) gets PBOX_D.001: key by the node name
+                    base = re.sub(r"\.\d{3,}$", "", o.name)
+                    meshes[o.name if o.name in names or base not in names else base] = o.data
                 for c in list(o.users_collection):
                     c.objects.unlink(o)
                 lib.objects.link(o)
@@ -187,7 +286,33 @@ class Batch:
         self.added = 0
         self.mesh_out = {}                   # part -> {"glb", "sha256"}: geometry sent to UE in this session
         self.rev = int(time.time())          # monotonic across restarts of the script
+        self.archive = Path(archive) if archive else archive_dir(self.out)
+        self.last_snapshot = None
+        self._orig_mesh = {}                 # table part -> its release mesh, while a loaded document replaces it
+        on_disk = self.read_out()
+        if on_disk:                          # never number below the file already there (rev-back = a snapshot)
+            try:
+                self.rev = max(self.rev, int(float(on_disk.get("rev"))))
+            except (TypeError, ValueError):
+                pass
         bpy.context.view_layer.update()
+
+    def read_out(self):
+        """the override document now in self.out (None: no file or unreadable)."""
+        try:
+            return json.loads(self.out.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return None
+
+    def snapshots(self, limit=20):
+        return list_snapshots(self.out, self.archive, limit)
+
+    def snapshot(self, reason):
+        """keep a copy of the current override file in archive/ (see snapshot_file)."""
+        snap = snapshot_file(self.out, reason, self.archive)
+        if snap:
+            self.last_snapshot = str(snap)
+        return snap
 
     def _spawn(self, iid):
         """(re)create the object of a table instance: a mesh when the parts GLB is loaded, else an Empty."""
@@ -413,6 +538,9 @@ class Batch:
     def reset(self, objs=None):
         if objs is None:
             self.mesh_out = {}               # back to the release geometry too
+            for part, me in self._orig_mesh.items():     # meshes a loaded document had replaced
+                self.meshes[part] = me
+            self._orig_mesh.clear()
             for iid, o in list(self.obj.items()):
                 if not alive(o) or o.name not in self.col.objects:     # deleted by hand (X) in Blender: bring it back
                     self._spawn(iid)
@@ -431,6 +559,142 @@ class Batch:
                 o.hide_viewport = o.hide_render = False
             elif iid:
                 bpy.data.objects.remove(o)
+
+    def _local_glb(self, path):
+        """a document's GLB on this machine: the path as written, else the same file name in <out>/meshes (remote mode
+        writes server paths into the document; the local copy keeps the name)."""
+        p = Path(path)
+        if p.exists():
+            return p
+        alt = self.out.parent / "meshes" / p.name
+        return alt if alt.exists() else None
+
+    def _import_part_mesh(self, glb, part):
+        """the single mesh of a part GLB (as export_part writes them), as a Blender mesh named after the part."""
+        before = set(bpy.data.objects)
+        bpy.ops.import_scene.gltf(filepath=str(glb))
+        new = [o for o in bpy.data.objects if o not in before]
+        meshes = [o.data for o in new if o.type == "MESH"]
+        for o in new:
+            bpy.data.objects.remove(o, do_unlink=True)
+        if len(meshes) != 1:
+            raise ValueError(f"{glb}: {len(meshes)} meshes, a part GLB has exactly one")
+        meshes[0].name = part
+        return meshes[0]
+
+    def load_overrides(self, src):
+        """put the scene into the state an override document describes - a snapshot from archive/, or the file already
+        in `out` when the add-on attaches again (user 10-10: reopening a window must not start from an empty file).
+        Everything goes back to the table first, then each listed instance is placed as listed; part meshes come from
+        the document's GLBs. Ash 10-10, all or nothing: the document, every GLB (present - as written or in <out>/meshes -,
+        its SHA-256 equal to the document's, importable) and every instance entry (its transform computed, finite) are
+        checked BEFORE the scene changes; anything wrong raises and leaves the scene as it was. After that only plain
+        assignments are made. Returns {"instances", "meshes", "missing_meshes": []}. Main thread."""
+        doc = src if isinstance(src, dict) else json.loads(Path(src).read_text(encoding="utf-8-sig"))
+        if doc.get("schema") != "renou-overrides/1" or doc.get("batch") != self.batch:
+            raise ValueError(f"not an override document of {self.batch}: {doc.get('schema')} / {doc.get('batch')}")
+        if doc.get("base_sha256") and doc["base_sha256"] != self.base_sha:
+            raise ValueError("the document was made against another version of the placements table")
+        staged = {}
+        try:
+            for part, m in (doc.get("meshes") or {}).items():
+                glb = self._local_glb(m["glb"])
+                if glb is None:
+                    raise FileNotFoundError(f"mesh {part}: {m['glb']} not found (nor in {self.out.parent / 'meshes'})")
+                got = hashlib.sha256(glb.read_bytes()).hexdigest()
+                if m.get("sha256") and got != m["sha256"]:
+                    raise ValueError(f"mesh {part}: {glb.name} has SHA-256 {got[:12]}, the document says {m['sha256'][:12]}")
+                staged[part] = (glb, got, self._import_part_mesh(glb, part + "__staged"))
+            plan = self._plan_instances(doc.get("instances") or {})
+        except Exception:
+            for _glb, _got, me in staged.values():
+                bpy.data.meshes.remove(me)
+            raise
+        # from here on nothing reads a file: the scene changes as a whole
+        self.reset()
+        table_parts = {r["part"] for r in self.base.values()}
+        for part, (glb, got, me) in staged.items():
+            me.name = part
+            if part in self.meshes and part not in self._orig_mesh:
+                self._orig_mesh[part] = self.meshes[part]
+            self.meshes[part] = me
+            if part not in table_parts:
+                self._slot_only_parts.add(part)          # new parts export slot names only, as add_object made them
+            self.mesh_out[part] = {"glb": str(glb), "sha256": got}
+            if self._sig:
+                self._sig[part] = mesh_sig(me)
+        for o in self.col.objects:                       # table objects of a replaced part show the loaded mesh
+            if o.type == "MESH" and o.get("blsync_part") in self.mesh_out and o.get("blsync_part") in self.meshes:
+                o.data = self.meshes[o["blsync_part"]]
+        for iid, kind, part, M, e in plan:
+            if kind == "new":
+                o = bpy.data.objects.new(iid, self.meshes.get(part))
+                o["blsync_id"], o["blsync_part"] = iid, part
+                o["blsync_era"], o["blsync_src"] = str(e.get("era", "both")), str(e.get("src", ""))
+                o.matrix_world = M
+                self.col.objects.link(o)
+                continue
+            o = self.obj.get(iid)
+            if o is None or not alive(o) or o.name not in self.col.objects:
+                o = self._spawn(iid)
+            if kind == "delete":
+                self.delete([o])
+                continue
+            if part != self.base[iid]["part"]:
+                self.set_part([o], part)
+            o.matrix_world = M
+        try:
+            self.rev = max(self.rev, int(float(doc.get("rev"))))
+        except (TypeError, ValueError):
+            pass
+        bpy.context.view_layer.update()
+        return {"instances": len(doc.get("instances") or {}), "meshes": len(doc.get("meshes") or {}),
+                "missing_meshes": []}
+
+    def _plan_instances(self, entries):
+        """every entry of a document checked, its object kind, part and world matrix computed - before load_overrides()
+        changes anything (Ash 10-10: a bad value in a late entry used to fail after the reset). Raises ValueError."""
+        plan = []
+        for iid, e in entries.items():
+            try:
+                if not isinstance(iid, str) or not isinstance(e, dict):
+                    raise ValueError("entry is not an object")
+                rec = self.base.get(iid)
+                if e.get("deleted"):
+                    if rec is not None:
+                        plan.append((iid, "delete", None, None, e))
+                    continue                         # a new instance marked deleted: nothing to show
+                part = e.get("part") if e.get("part") is not None else (rec or {}).get("part")
+                if not isinstance(part, str) or not part:
+                    raise ValueError("no part")
+                M = mat_of(dict(rec, **e) if rec is not None else e)
+                if not all(math.isfinite(v) for row in M for v in row):
+                    raise ValueError("transform is not finite")
+                plan.append((iid, "table" if rec is not None else "new", part, M, e))
+            except Exception as exc:
+                raise ValueError(f"instance {iid}: {type(exc).__name__}: {exc}") from exc
+        return plan
+
+    def snapshot_scene(self, reason="scene"):
+        """keep the scene's current state (unpublished edits included) in archive/ as an override document - before a
+        restore replaces it (Ash 10-10: the file on disk may not hold the newest edits). Part meshes edited but not yet
+        exported are exported first (Ash 10-10: otherwise a restore loses unpublished geometry): with track_edits every part
+        whose mesh changed since load / last export, without it the parts already sent (they may have been edited
+        since). Object mode only (edit-mode changes are not in the mesh yet)."""
+        if bpy.context.mode != "OBJECT":
+            raise RuntimeError("leave edit mode first: edits made there are not in the mesh yet")
+        for part in list(self.meshes if self._sig else self.mesh_out):
+            if self._sig:
+                self.export_part_if_changed(part)
+            else:
+                self.export_part(part)
+        doc = {"schema": "renou-overrides/1", "batch": self.batch, "base_sha256": self.base_sha, "rev": self.rev,
+               "label": f"scene before {reason} (unpublished edits included)", "written": time.time(),
+               "instances": self.overrides(),
+               "meshes": {p: {"glb": m["glb"], "sha256": m["sha256"]} for p, m in self.mesh_out.items()}}
+        snap = snapshot_bytes(self.out, json.dumps(doc, ensure_ascii=False).encode("utf-8"), reason, self.archive)
+        self.last_snapshot = str(snap)
+        return snap
 
     # ---- output
     def overrides(self):
@@ -488,10 +752,15 @@ class Batch:
         if self.remote:
             ov["meshes"] = self._push_meshes(ov["meshes"])
             ov["written"] = time.time()
+        if self.out.exists():                # user 10-10: nothing that shrinks or replaces the file without a copy first
+            old = self.read_out()
+            why = replace_risk(old, ov) if old is not None else "unreadable"
+            if why:
+                self.snapshot(why)
         tmp = self.out.with_suffix(".tmp")
         tmp.write_text(json.dumps(ov, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.out)
-        res = {"rev": ov["rev"], "overrides": len(ov["instances"]), "ue": None}
+        res = {"rev": ov["rev"], "overrides": len(ov["instances"]), "ue": None, "snapshot": self.last_snapshot}
         if self.remote:
             res["push_s"] = self._push_file(self.out)
         return res

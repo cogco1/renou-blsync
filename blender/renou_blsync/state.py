@@ -18,6 +18,8 @@ DIRTY = set()        # batch names with unpublished changes
 GEO_DIRTY = {}       # batch name -> parts whose mesh may have changed (checked by signature before export)
 RESULTS = {}         # batch name -> last delivery result, main-thread copy for the panel
 LAST_SENT = {}       # batch name -> signature of the last document sent (skip identical live publishes)
+BLOCKED = {}         # batch name -> why it is not published (its file could not be loaded back when attaching)
+SNAPS = {}           # batch name -> (time read, newest snapshots) for the panel (the folder is read at most every 2 s)
 LIVE = False
 LAST_ERROR = ""
 RECEIPT_WAIT = 5.0   # seconds the worker waits for UE's receipt before moving on
@@ -42,6 +44,18 @@ def batch_for(iid):
     return None
 
 
+def snapshots(name, limit=8):
+    import time
+    t, rows = SNAPS.get(name, (0.0, []))
+    if time.time() - t > 2.0 and name in BATCHES:
+        try:
+            rows = BATCHES[name].snapshots(limit)
+        except Exception:
+            rows = []
+        SNAPS[name] = (time.time(), rows)
+    return rows
+
+
 def reset_all():
     global LIVE, LAST_ERROR
     BATCHES.clear()
@@ -49,5 +63,7 @@ def reset_all():
     GEO_DIRTY.clear()
     RESULTS.clear()
     LAST_SENT.clear()
+    SNAPS.clear()
+    BLOCKED.clear()
     LIVE = False
     LAST_ERROR = ""

@@ -1141,12 +1141,134 @@ def attach(req, remember=True):
     return b.report
 
 
+ARCHIVE_KEEP = 50    # = renou_blsync_lib.ARCHIVE_KEEP
+
+
+def replace_risk(old, new):
+    """= renou_blsync_lib.replace_risk (user 10-10): why replacing override document old by new could lose work."""
+    if not old:
+        return None
+    oi, ni = old.get("instances") or {}, new.get("instances") or {}
+    if oi and not ni:
+        return "cleared"
+    if old.get("base_sha256") and new.get("base_sha256") and old["base_sha256"] != new["base_sha256"]:
+        return "base-changed"
+    try:
+        if float(new.get("rev")) < float(old.get("rev")):
+            return "rev-back"
+    except (TypeError, ValueError):
+        pass
+    gone = set(oi) - set(ni)
+    if gone:
+        return f"dropped{len(gone)}"
+    gm = set(old.get("meshes") or {}) - set(new.get("meshes") or {})
+    if gm:
+        return f"meshes-dropped{len(gm)}"
+    common = set(oi) & set(ni)
+    if len(common) >= 10 and sum(oi[k] != ni[k] for k in common) > len(common) / 2:
+        return "rewritten"
+    return None
+
+
+def _archive_dirs(path):
+    return [Path(path).parent / "archive", CTRL / "archive"]     # the second when the first is not writable
+
+
+def snapshot_raw(path, raw, reason):
+    """keep the bytes of the override file bl_sync applied last, before a version that shrinks or replaces it is applied
+    (whoever wrote it: the add-on keeps its own copies, scripts may not). Same naming and rotation as
+    renou_blsync_lib.snapshot_file: archive/<stem>__<yyyymmdd-hhmmss-mmm>__rev<rev>__<reason>__<sha8>.json. Ash 10-10:
+    the content's SHA in the name and an exclusive create, so two different contents never share a name; a copy is
+    only reported once it is on disk with exactly these bytes. A copy identical to the newest one is not made again;
+    the newest ARCHIVE_KEEP stay. Returns the snapshot path, or None when no folder could take it."""
+    p = Path(path)
+    sha8 = hashlib.sha256(raw).hexdigest()[:8]
+    for d in _archive_dirs(path):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            olds = sorted(d.glob(f"{p.stem}__*.json"))
+            if olds and olds[-1].read_bytes() == raw:
+                return str(olds[-1])
+            try:
+                rev = json.loads(raw.decode("utf-8-sig")).get("rev")
+            except Exception:
+                rev = "unreadable"
+            t = time.time()
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(t)) + f"-{int(t * 1000) % 1000:03d}"
+            why = re.sub(r"[^0-9A-Za-z_-]+", "-", str(reason))[:40]
+            snap = d / f"{p.stem}__{stamp}__rev{rev}__{why}__{sha8}.json"
+            if snap.exists():
+                if snap.read_bytes() == raw:
+                    return str(snap)
+                continue                            # a name collision with other bytes: never overwrite
+            with open(snap, "xb") as fh:            # exclusive: fails rather than replaces
+                fh.write(raw)
+            if snap.read_bytes() != raw:
+                continue
+            for old in sorted(d.glob(f"{p.stem}__*.json"))[:-ARCHIVE_KEEP]:
+                old.unlink()
+            return str(snap)
+        except OSError:
+            continue
+    return None
+
+
+APPLIED = CTRL / "applied"      # the last applied bytes of each watched file, so a restart can still keep them
+
+
+def _applied_key(path):
+    return APPLIED / f"{Path(path).stem}__{hashlib.sha256(str(path).encode()).hexdigest()[:8]}.json"
+
+
+def _remember_applied(path, raw):
+    try:
+        APPLIED.mkdir(parents=True, exist_ok=True)
+        f = _applied_key(path)
+        f.with_suffix(".tmp").write_bytes(raw)
+        f.with_suffix(".tmp").replace(f)
+    except OSError:
+        pass
+
+
+def _applied_on_disk(path):
+    """(path, bytes, document) bl_sync applied last for this file, from Saved/BlSync/applied/ (None if never)."""
+    try:
+        raw = _applied_key(path).read_bytes()
+        return (str(path), raw, json.loads(raw.decode("utf-8-sig")))
+    except Exception:
+        return None
+
+
+def latest_snapshot(path):
+    p, best = Path(path), None
+    for d in _archive_dirs(path):
+        fs = sorted(d.glob(f"{p.stem}__*.json")) if d.exists() else []
+        if fs and (best is None or fs[-1].name > best.name):
+            best = fs[-1]
+    return str(best) if best else None
+
+
 def apply_file(path, name=None):
-    ov = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    raw = Path(path).read_bytes()
+    ov = json.loads(raw.decode("utf-8-sig"))
     assert ov.get("schema") == "renou-overrides/1", ov.get("schema")
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
+    prev, why = getattr(b, "file_prev", None), None
+    if not prev or prev[0] != str(path):
+        prev = _applied_on_disk(path)               # Ash 10-10: after a restart the last applied bytes come from disk
+    if prev:
+        why = replace_risk(prev[2], ov)
+        if why:
+            snap = snapshot_raw(path, prev[1], why)
+            if snap is None:                        # no copy, no destructive change (Ash 10-10)
+                raise RuntimeError(f"not applied: {Path(path).name} would be {why}, and the previous version could "
+                                   f"not be kept in archive/ (both folders unwritable?)")
     out = b.apply(ov)
+    b.file_prev = (str(path), raw, ov)
+    _remember_applied(path, raw)
+    if why:
+        out["snapshot_made"] = why
     if not hasattr(b, "files"):
         b.files = set()
     b.files.add(str(path))                          # detach(name) drops these from the watch
@@ -1155,6 +1277,8 @@ def apply_file(path, name=None):
 
 
 def _receipt(b, out):
+    if getattr(b, "file_prev", None):
+        out["snapshot"] = latest_snapshot(b.file_prev[0])     # user 10-10: the receipt names the newest copy
     out["batch"] = b.data.get("batch") or b.name   # Ash 10-10: every receipt says whose it is (rev alone can collide)
     out["applied_at"] = time.time()
     if out.get("written"):
