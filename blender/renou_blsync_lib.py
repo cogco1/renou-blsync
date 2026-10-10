@@ -66,9 +66,25 @@ def canon(q):
     return q
 
 
-def same_rotation(a, b, eps=1e-9):
-    """True when two unit quaternions are the same rotation, whatever their signs (|a.b| = cos of half the angle)."""
-    return abs(a.normalized().dot(b.normalized())) > 1.0 - eps   # table quaternions carry 7 decimals: not exactly unit
+ROT_TOL = 1e-5      # radians (0.00057 deg, 1 mm at 100 m). Blender 5.2.2, 10,000 random rotations: a float32 matrix round
+                    # trip differs by at most 7.4e-7 rad, 7-decimal table quaternions by 1.8e-7; a 0.01 deg edit is 1.7e-4
+
+
+def rotation_angle(a, b):
+    """angle in radians between the rotations of two quaternions (wxyz, any sign, any length), in double precision.
+    The chord |a - s b| (s = sign of a.b) is 2 sin(angle / 4): no cancellation near 1, unlike 1 - |a.b|."""
+    a, b = [float(x) for x in a], [float(x) for x in b]
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(x * x for x in b))
+    a, b = [x / na for x in a], [x / nb for x in b]
+    s = 1.0 if sum(x * y for x, y in zip(a, b)) >= 0.0 else -1.0
+    chord = math.sqrt(sum((x - s * y) ** 2 for x, y in zip(a, b)))
+    return 4.0 * math.asin(min(1.0, chord / 2.0))
+
+
+def same_rotation(a, b, tol=ROT_TOL):
+    """True when two quaternions are the same rotation within tol radians, whatever their signs (#31). Ash 10-10: the
+    float32 |a.b| > 1 - 1e-9 test called 190 of 10,000 identical rotations different."""
+    return rotation_angle(a, b) <= tol
 
 
 def decompose(m):
