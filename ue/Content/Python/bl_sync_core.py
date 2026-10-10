@@ -401,15 +401,18 @@ class Batch:
     def needs_glb_materials(self, names, old_mesh):
         """True when some slot of the new mesh would end on "keep" (KEEP_GLB) with nothing in UE to show for it."""
         old = {_norm(n) for n in slot_names(old_mesh)} if old_mesh else set()
-        for n in names:
-            k = _norm(n)
-            if k in old:
-                continue
-            m, how = self.ue_material(n)
-            if how in ("keep", "keep_textured"):
-                return True
-        self.unmapped -= {n for n in names}         # ue_material() above only looked; the real assignment reports again
-        return False
+        seen = set(self.unmapped)                   # ue_material() below only looks: what it adds is taken back, and
+        try:                                        # nothing reported for other meshes is dropped (Ash 10-10)
+            for n in names:
+                k = _norm(n)
+                if k in old:
+                    continue
+                m, how = self.ue_material(n)
+                if how in ("keep", "keep_textured"):
+                    return True
+            return False
+        finally:
+            self.unmapped = seen
 
     def carry_materials(self, comp, old_mesh, new_mesh):
         """switch comp to new_mesh; a slot with the same name as on the old mesh keeps exactly the material UE showed
@@ -418,9 +421,12 @@ class Batch:
         self.textured_now = getattr(self, "textured_by_mesh", {}).get(new_mesh.get_path_name(), set())
         comp.set_static_mesh(new_mesh)
         rep = {}
+        ph = PLACEHOLDER.split(".")[0]
         for j, n in enumerate(slot_names(new_mesh)):
             m = before.get(_norm(n))
             how = "carried"
+            if m is not None and m.get_path_name().split(".")[0] == ph:
+                m = None                            # a placeholder is not UE's material: resolve again, report if still none
             if m is None:
                 m, how = self.ue_material(n)
             if m is not None:
@@ -659,6 +665,7 @@ class Batch:
         if ov.get("base_sha256") and self.base_sha and ov["base_sha256"] != self.base_sha:
             raise ValueError(f"override base {ov['base_sha256'][:12]} != loaded table {self.base_sha[:12]}")
         self.last_ov = ov
+        self.finish_failed = 0.0                    # a new version: a failed finish of earlier imports may retry at once
         self.revert_meshes(set(ov.get("meshes") or {}), out)
         self.update_meshes(ov.get("meshes"), out)
         new = {}
@@ -1052,15 +1059,28 @@ def _save_session(sess):
     SESSION.with_suffix(".tmp").replace(SESSION)
 
 
+def record_name(r):
+    """the batch name an attach request resolves to - the key of S["batches"], of session records and of detach(name).
+    Ash 10-10: a vegetation attach without "name" is named after its table's batch, but the session used the
+    placements path, so a single detach never removed the record and a restart brought the batch back."""
+    if r.get("name"):
+        return r["name"]
+    try:
+        return json.loads(Path(r["placements"]).read_text(encoding="utf-8-sig"))["batch"]
+    except Exception:
+        return r.get("placements")
+
+
 def restore():
     """after an editor restart: attach every batch of the session file again and watch its files (the override files
     are cumulative, so the preview comes back as it was). Batches that fail are reported and kept in the file."""
     sess, out = _session(), {"attached": {}, "failed": {}}
     for req in sess.get("attach", []):
+        key = record_name(req)
         try:
-            out["attached"][req.get("name") or req.get("placements")] = attach(req, remember=False)
+            out["attached"][key] = attach(req, remember=False)
         except Exception as exc:
-            out["failed"][req.get("name") or req.get("placements")] = str(exc)[:300]
+            out["failed"][key] = str(exc)[:300]
     w = sess.get("watch")
     if w and w.get("paths"):
         out["watch"] = watch(w["paths"], w.get("interval", 0.2), remember=False)
@@ -1073,7 +1093,8 @@ def attach(req, remember=True):
     if remember:
         sess = _session()
         keep = {k: v for k, v in req.items() if k not in ("id", "script", "action")}
-        sess["attach"] = [r for r in sess.get("attach", []) if (r.get("name") or r.get("placements")) != b.name] + [keep]
+        keep["name"] = b.name                       # the resolved name, so detach(name) and restore agree
+        sess["attach"] = [r for r in sess.get("attach", []) if record_name(r) != b.name] + [keep]
         _save_session(sess)
     S["batches"][b.name] = b
     log(f"attached {b.name}: {b.report}")
@@ -1085,34 +1106,58 @@ def apply_file(path, name=None):
     assert ov.get("schema") == "renou-overrides/1", ov.get("schema")
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
-    return _receipt(b, b.apply(ov))
+    out = b.apply(ov)
+    if not hasattr(b, "files"):
+        b.files = set()
+    b.files.add(str(path))                          # detach(name) drops these from the watch
+    out["file"] = str(path)
+    return _receipt(b, out)
 
 
 def _receipt(b, out):
+    out["batch"] = b.data.get("batch") or b.name   # Ash 10-10: every receipt says whose it is (rev alone can collide)
     out["applied_at"] = time.time()
     if out.get("written"):
         out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)
-    body = json.dumps(out, ensure_ascii=False)
-    (CTRL / "status.tmp").write_text(body, encoding="utf-8")
-    (CTRL / "status.tmp").replace(CTRL / "status.json")      # the last receipt of any batch (kept for old readers)
-    one = CTRL / f"status_{b.data.get('batch') or b.name}.json"   # one receipt per batch: two writers never mix receipts
-    one.with_suffix(".tmp").write_text(body, encoding="utf-8")
-    one.with_suffix(".tmp").replace(one)
+    write_receipt(out["batch"], out)
     return out
+
+
+def write_receipt(batch, body):
+    """status_<batch>.json (the batch's own receipt) and status.json (the last receipt of any batch, for old readers);
+    both carry "batch", so a reader can check it is reading its own."""
+    text = json.dumps(dict(body, batch=batch), ensure_ascii=False)
+    for f in ([CTRL / f"status_{batch}.json"] if batch else []) + [CTRL / "status.json"]:
+        f.with_suffix(".tmp").write_text(text, encoding="utf-8")
+        f.with_suffix(".tmp").replace(f)
+
+
+def _file_batch(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8-sig")).get("batch")
+    except Exception:
+        return None
+
+
+FINISH_RETRY_S = 60.0   # a failed finish of finished imports is tried again after this (a new file version: at once)
 
 
 def _imports_tick():
     """#28: start queued imports; the first batch with a finished import switches its meshes and writes its receipt
-    (one batch per tick)."""
+    (one batch per tick). Ash 10-10: a finish that fails writes a final error receipt (batch, rev, the meshes still
+    pending) and stays retryable - again after FINISH_RETRY_S, or at once when a new version of the file is applied."""
     if not _ASYNC or S.get("suspended"):
         return
     _pump_imports()
     for b in list(S["batches"].values()):
         if not b.pending:
             continue
+        if time.time() - getattr(b, "finish_failed", 0.0) < FINISH_RETRY_S:
+            continue
         S["busy"] = True
         try:
             out = b.finish_imports()
+            b.finish_failed = 0.0
             if out is not None:
                 _receipt(b, out)
                 log(f"meshes in for {b.name} rev {out.get('rev')}: {[m.get('part') for m in out.get('meshes', [])]} "
@@ -1121,7 +1166,10 @@ def _imports_tick():
         except Exception:
             err = traceback.format_exc()
             unreal.log_error("[BLSYNC] " + err)
-            b.pending.clear()                       # never retry a broken finish every tick; the next file change does
+            b.finish_failed = time.time()
+            write_receipt(b.data.get("batch") or b.name,
+                          {"rev": b.rev, "error": err[-2000:], "t": time.time(), "complete": False,
+                           "pending_meshes": sorted(b.pending), "retry_in_s": FINISH_RETRY_S})
         finally:
             S["busy"] = False
 
@@ -1150,7 +1198,7 @@ def _watch_tick(dt):
         except Exception:
             err = traceback.format_exc()
             unreal.log_error("[BLSYNC] " + err)
-            (CTRL / "status.json").write_text(json.dumps({"error": err, "file": path, "t": time.time()}), encoding="utf-8")
+            write_receipt(_file_batch(path), {"error": err, "file": path, "t": time.time()})
         finally:
             S["busy"] = False
         # the file read is the one applied; if it changed meanwhile, the next tick sees a new signature and applies it
@@ -1191,14 +1239,22 @@ def detach(name=None, forget=True):
     """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch
     (also in the session file: a later restore will not bring it back). forget=False (code reload): the session file
     is kept, so restore() right after brings everything back."""
+    gone_paths = []
+    if name and S.get("watch"):                   # one batch: its watched files go too (the others keep theirs)
+        b = S["batches"].get(name)
+        mine = {b.data.get("batch"), name} if b else {name}
+        gone_paths = [p for p in S["watch"]["paths"] if p in getattr(b, "files", ()) or _file_batch(p) in mine]
+        S["watch"]["paths"] = [p for p in S["watch"]["paths"] if p not in gone_paths]
     if forget:
         sess = _session()
-        sess["attach"] = [r for r in sess.get("attach", []) if name and (r.get("name") or r.get("placements")) != name]
+        sess["attach"] = [r for r in sess.get("attach", []) if name and record_name(r) != name]
         if not name:
             sess["watch"] = None
+        elif sess.get("watch") and gone_paths:
+            sess["watch"]["paths"] = [p for p in sess["watch"]["paths"] if p not in gone_paths]
         _save_session(sess)
     if not name:
-        unwatch(remember=False)                   # one batch: the others keep being watched
+        unwatch(remember=False)
     out = {}
     for n in ([name] if name else list(S["batches"])):
         if n in S["batches"]:
@@ -1206,6 +1262,7 @@ def detach(name=None, forget=True):
             del S["batches"][n]
     if name:
         out["save_guard"] = reguard()             # only what the remaining batches still need
+        out["unwatched"] = gone_paths
         return out
     left = _guard_state()
     guard(list(left), False)                      # also files guarded by an earlier editor session
