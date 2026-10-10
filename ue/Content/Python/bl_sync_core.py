@@ -120,11 +120,21 @@ def log(msg):
     unreal.log("[BLSYNC] " + str(msg))
 
 
+_SHA = {}           # path -> ((mtime_ns, size), sha256)
+
+
 def sha_file(path):
+    """SHA-256 of a file, remembered while its modification time and size stay the same. Live 10-10 01:19: after a
+    suspend every GLB of the north slope (3.3 GB, IC01 alone 400 MB) was hashed again - 11-19 s per batch."""
+    st = os.stat(path)
+    key, hit = (st.st_mtime_ns, st.st_size), _SHA.get(str(path))
+    if hit and hit[0] == key:
+        return hit[1]
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 24), b""):
             h.update(chunk)
+    _SHA[str(path)] = (key, h.hexdigest())
     return h.hexdigest()
 
 
@@ -780,11 +790,13 @@ def guard(files, on):
 
 
 def reguard():
-    """level files read-only exactly while some attached batch in them differs from its table (and not suspended)."""
+    """level files read-only exactly while some attached batch in them differs from its table. A batch suspend() put
+    back to its table needs no guard; batches suspend() kept as they are stay guarded during the save."""
     want, every = set(), set()
+    held = set(S.get("held") or ())
     for b in S["batches"].values():
         every |= set(b.level_files)
-        if (b.applied or b.mesh_sha) and not S.get("suspended"):
+        if (b.applied or b.mesh_sha) and not (S.get("suspended") and b.name in held):
             want |= set(b.level_files)
     guard(sorted(want), True)
     guard(sorted((every | set(_guard_state())) - want), False)
@@ -1066,20 +1078,62 @@ def remap(name=None):
     return out
 
 
-def suspend():
-    """before UE saves: every preview goes back to its table for a moment (files writable). Nothing is lost - override
-    files are cumulative and resume() simply reads them again."""
+def _level_on_disk(world_path):
+    p = world_path.split(".")[0]
+    if not p.startswith("/Game/"):
+        return None
+    f = Path(unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())) / (p[6:] + ".umap")
+    return str(f.resolve()) if f.exists() else None
+
+
+def suspend(level=None, all_batches=False):
+    """before 视效 saves a level: the batches whose actors live in that level (default: the open persistent level, e.g.
+    VEG_S02 in L_S02) go back to their table for a moment and their files become writable. Every other batch stays as
+    it is: its own sublevel (/Game/Inst/<batch>/L_<batch>) stays read-only while it differs from the table (R3), so the
+    save cannot take preview state with it. Live 10-10 01:18: resetting the four north-slope sublevel batches made the
+    preview vanish and come back over 45 s. all_batches=True puts every batch back (the old behaviour).
+    Nothing is lost - override files are cumulative and resume() reads them again."""
+    if level is None:
+        try:
+            level = _level_on_disk(UES.get_editor_world().get_path_name())
+        except Exception:
+            level = None
     S["suspended"] = True
-    out = {n: b.apply({"rev": "suspended", "instances": {}, "meshes": {}}) for n, b in S["batches"].items()}
+    held, out = [], {}
+    for n, b in S["batches"].items():
+        if all_batches or not b.level_files or (level and level in b.level_files):
+            out[n] = b.apply({"rev": "suspended", "instances": {}, "meshes": {}})
+            held.append(n)
+        else:
+            out[n] = {"kept": True, "rev": b.rev, "level_files": b.level_files}
+    S["held"] = held
     out["save_guard"] = reguard()
+    out["level"] = level
     return out
 
 
 def resume():
-    S["suspended"] = False
-    if S.get("watch"):
-        S["watch"]["sig"] = {}                      # next tick applies every watched file again
-    return {"resumed": True, "watching": (S.get("watch") or {}).get("paths")}
+    """after the save: the batches suspend() put back are applied again from their files right here (with the SHA
+    cache this takes a fraction of a second), so when resume returns everything is back; the others never left."""
+    held = S.get("held")
+    S["suspended"], S["held"] = False, None
+    w, out = S.get("watch"), {}
+    if held is None:                                # a suspend from before this version: let the watch apply all
+        if w:
+            w["sig"] = {}
+        out["resumed"] = "all, through the watch"
+    for n in held or ():
+        prev = getattr(S["batches"].get(n), "file_prev", None)
+        if prev and os.path.exists(prev[0]):
+            r = apply_file(prev[0], n)
+            out[n] = {k: r.get(k) for k in ("rev", "counts", "seconds", "complete", "pending_meshes")}
+            if w and prev[0] in w["paths"]:
+                w["sig"][prev[0]] = _sig(prev[0])   # applied just now: the watch need not do it again
+        elif w:
+            w["sig"] = {}
+    out["save_guard"] = reguard()
+    out["watching"] = (w or {}).get("paths")
+    return out
 
 
 SESSION = CTRL / "session.json"
@@ -1484,7 +1538,7 @@ def _dispatch(req):
     if act == "restore":
         return restore()
     if act == "suspend":
-        return suspend()
+        return suspend(req.get("level"), bool(req.get("all")))
     if act == "resume":
         return resume()
     if act == "remap":
