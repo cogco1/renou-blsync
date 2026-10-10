@@ -449,6 +449,30 @@ try:
     check("load_overrides: a GLB whose SHA-256 differs is refused, also when found through the meshes/ fallback",
           refused(bad_sha, "sha") and refused(bad_glb, "fallback"))
     check("load_overrides: a broken JSON file is refused, scene unchanged", refused(str(broken), "json"))
+    # Ash 10-10 re-review: entries are checked before the reset (a bad value in a late entry, a NaN, a new one without part)
+    late = sorted(S2.base)[-1]
+    for name, entry in (("null pos", {"pos": None, "quat_wxyz": [1, 0, 0, 0], "scale": [1, 1, 1]}),
+                        ("NaN pos", {"pos": [float("nan"), 0, 0], "quat_wxyz": [1, 0, 0, 0], "scale": [1, 1, 1]}),
+                        ("new without part", None)):
+        bad = json.loads(json.dumps(good))
+        if entry is None:
+            bad["instances"]["test_01_bl_nopart"] = {"era": "both", "pos": [1, 2, 3], "quat_wxyz": [1, 0, 0, 0], "scale": [1, 1, 1]}
+        else:
+            bad["instances"][late] = entry
+        check(f"load_overrides: an instance entry with {name} is refused before anything changes", refused(bad, name))
+    # ... and unpublished geometry is in the scene snapshot taken before a restore
+    me = S2.meshes["PBOX_D"]
+    x0 = min(v.co.x for v in me.vertices)
+    for v in me.vertices:
+        v.co.x += 3.0                                    # an unpublished mesh edit
+    me.update()
+    geo = S2.snapshot_scene("geo")
+    S2.load_overrides(good)                              # the restore target: the edit is gone from the scene
+    gone = min(v.co.x for v in S2.meshes["PBOX_D"].vertices)
+    S2.load_overrides(str(geo))                          # and the backup brings it back
+    back = min(v.co.x for v in S2.meshes["PBOX_D"].vertices)
+    check("snapshot_scene: an unpublished mesh edit survives restore -> restore of the backup",
+          abs(gone - x0) < 1e-4 and abs(back - (x0 + 3.0)) < 1e-4, (round(x0, 4), round(gone, 4), round(back, 4)))
     sc = S2.snapshot_scene("test")
     scdoc = json.loads(Path(sc).read_text(encoding="utf-8"))
     check("snapshot_scene: the scene (unpublished edits included) is kept as an override document",
