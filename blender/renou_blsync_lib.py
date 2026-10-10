@@ -55,11 +55,41 @@ def mat_of(rec):
     return Matrix.LocRotScale(Vector(rec["pos"]), q, s)
 
 
+def canon(q):
+    """q and -q are the same rotation: make the first clearly non-zero component (w, x, y, z) positive. "w < 0" alone
+    is not enough - a 180 deg turn about a horizontal axis has w = 0 and its sign is then decided by x / y / z (#31)."""
+    for c in (q.w, q.x, q.y, q.z):
+        if abs(c) > 1e-6:
+            if c < 0:
+                q.negate()
+            break
+    return q
+
+
+ROT_TOL = 1e-5      # radians (0.00057 deg, 1 mm at 100 m). Blender 5.2.2, 10,000 random rotations: a float32 matrix round
+                    # trip differs by at most 7.4e-7 rad, 7-decimal table quaternions by 1.8e-7; a 0.01 deg edit is 1.7e-4
+
+
+def rotation_angle(a, b):
+    """angle in radians between the rotations of two quaternions (wxyz, any sign, any length), in double precision.
+    The chord |a - s b| (s = sign of a.b) is 2 sin(angle / 4): no cancellation near 1, unlike 1 - |a.b|."""
+    a, b = [float(x) for x in a], [float(x) for x in b]
+    na, nb = math.sqrt(sum(x * x for x in a)), math.sqrt(sum(x * x for x in b))
+    a, b = [x / na for x in a], [x / nb for x in b]
+    s = 1.0 if sum(x * y for x, y in zip(a, b)) >= 0.0 else -1.0
+    chord = math.sqrt(sum((x - s * y) ** 2 for x, y in zip(a, b)))
+    return 4.0 * math.asin(min(1.0, chord / 2.0))
+
+
+def same_rotation(a, b, tol=ROT_TOL):
+    """True when two quaternions are the same rotation within tol radians, whatever their signs (#31). Ash 10-10: the
+    float32 |a.b| > 1 - 1e-9 test called 190 of 10,000 identical rotations different."""
+    return rotation_angle(a, b) <= tol
+
+
 def decompose(m):
     loc, q, s = m.decompose()
-    if q.w < 0:
-        q.negate()
-    return loc, q, s
+    return loc, canon(q), s
 
 
 def mesh_sig(me):
@@ -421,7 +451,7 @@ class Batch:
                 inst[iid] = dict(e, part=o["blsync_part"], era=o["blsync_era"], src=o["blsync_src"])
                 continue
             bl, bq, bs = decompose(mat_of(rec))
-            moved = (loc - bl).length > 1e-4 or bq.rotation_difference(q).angle > 1e-5 or (s - bs).length > 1e-5
+            moved = (loc - bl).length > 1e-4 or not same_rotation(bq, q) or (s - bs).length > 1e-5
             if o["blsync_part"] != rec["part"]:
                 e["part"] = o["blsync_part"]
             elif not moved:

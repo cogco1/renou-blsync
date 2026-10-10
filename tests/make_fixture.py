@@ -90,6 +90,11 @@ def placements():
     rows.append({"id": f"{BATCH}_{n:06d}", "part": "PBAKED_BLK1", "lods": ["NEAR"], "pos": [0.0, 0.0, 0.0],
                  "quat_wxyz": [1.0, 0.0, 0.0, 0.0], "yaw_deg": 0.0, "scale": 1.0, "district": BATCH, "zone": "test",
                  "era": "both", "building_id": "BLK_BAKED", "src": "BLK_BAKED | synthetic, world-baked like CBD fill blocks"})
+    n += 1                                           # #31: turned 180 deg about a horizontal axis, w = 0
+    rows.append({"id": f"{BATCH}_{n:06d}", "part": "PBOX_A", "lods": ["NEAR"], "pos": [200.0, 0.0, 0.0],
+                 "quat_wxyz": [0.0, -0.7649933, 0.6440383, 0.0], "yaw_deg": 0.0, "scale": 1.0, "district": BATCH,
+                 "zone": "test", "era": "both", "building_id": "BLD_FLIP",
+                 "src": "BLD_FLIP | synthetic, upside down (quaternion w = 0) like 209 rows of area_04_04"})
     return {"schema": "renou-placements/1", "coord": "blender_zup_m", "batch": BATCH, "source": "synthetic fixture",
             "count": len(rows), "instances": rows}
 

@@ -22,8 +22,12 @@ def live(script, req, timeout=300):
         return {"raw": r.stdout[-300:], "err": r.stderr[-300:]}
 
 
+CAM = os.environ.get("BLSYNC_CAM", "P1_ssw205")
+PFX = os.environ.get("BLSYNC_PFX", "live")
+
+
 def shot(tag):
-    r = live("lk_shot.py", {"cam": "P1_ssw205", "res": [1600, 900], "out": f"{J}out/live_{tag}.png", "frames": 45}, 300)
+    r = live("lk_shot.py", {"cam": CAM, "res": [1600, 900], "out": f"{G}tmp/blsync_check/{PFX}_{tag}.png", "frames": 45}, 300)
     return (r.get("done") or {}).get("status")
 
 
@@ -58,5 +62,5 @@ step("3_mesh", "BLK_002's part 25 % taller (single-part re-import)")
 B.reset()
 step("4_reset", "reset: back to the release table")
 Path = __import__("pathlib").Path
-Path(J + "out/vis_live.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+Path(J + f"out/vis_{PFX}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
 print("VISLIVE " + json.dumps([{k: s[k] for k in ("tag", "latency_s", "ue_s", "counts", "errors", "shot")} for s in res["steps"]]))
