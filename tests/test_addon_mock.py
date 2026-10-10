@@ -116,6 +116,28 @@ try:
     check("reset: back to the table, deleted object restored, no overrides",
           r.get("overrides") == 0 and gone_id in B.col.objects and not overrides()["instances"], r.get("overrides"))
 
+    # user 10-10: what 全部还原 cleared is kept; the panel lists it; one click brings it back; attaching again goes on
+    snaps = state.snapshots("test_01")
+    check("全部还原 left a snapshot the panel lists", snaps and snaps[0]["reason"] == "cleared" and snaps[0]["instances"] >= 3,
+          snaps[:1])
+    kept = json.loads(Path(snaps[0]["path"]).read_text(encoding="utf-8"))
+    check("restore operator", bpy.ops.renou.restore_snapshot(batch="test_01", path=snaps[0]["path"]) == {"FINISHED"})
+    r = settle()
+    now = overrides()
+    check("restore: the file holds the snapshot's instances and meshes again, receipt back",
+          set(now["instances"]) == set(kept["instances"]) and set(now["meshes"]) == set(kept["meshes"])
+          and (r.get("ue") or {}).get("rev") == r.get("rev"), (sorted(now["instances"]), r.get("ue")))
+    check("restore: the cleared state before it was kept too (nothing is ever lost by a restore)",
+          len(state.rb.list_snapshots(OV)) >= 1)
+    before_ids = set(now["instances"])
+    check("attach again (a reopened window)", bpy.ops.renou.attach() == {"FINISHED"})
+    B2 = state.BATCHES["test_01"]
+    check("attach again: goes on from the file, not from the table", set(B2.overrides()) == before_ids,
+          sorted(B2.overrides()))
+    r = settle()
+    check("attach again: the next publish keeps every instance (no empty overwrite)",
+          set(overrides()["instances"]) == before_ids and r.get("overrides") == len(before_ids), r.get("overrides"))
+
     renou_blsync.unregister()
     check("unregister cleans up", not hasattr(bpy.types.Scene, "renou_sync") and not state.BATCHES
           and live.on_depsgraph not in bpy.app.handlers.depsgraph_update_post)

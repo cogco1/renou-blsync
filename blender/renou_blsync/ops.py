@@ -26,9 +26,21 @@ class RENOU_OT_attach(bpy.types.Operator):
         B = state.rb.Batch(_abs(s.placements), out=_abs(s.out), **kw)
         if B.batch in state.BATCHES:
             self.report({"WARNING"}, f"{B.batch} 已载入过，新载入的这一份替换旧的")
+        msg = f"{B.batch}: {len(B.obj)} 个实例"
+        doc = B.read_out() if s.resume else None
+        if doc and (doc.get("instances") or doc.get("meshes")):
+            # user 10-10: reattaching (a reopened window) goes on from the file instead of overwriting it with the table
+            try:
+                r = B.load_overrides(doc)
+                msg += f"，接着已有覆盖：{r['instances']} 条，网格 {r['meshes']} 个"
+                if r["missing_meshes"]:
+                    msg += f"（找不到 GLB：{', '.join(r['missing_meshes'][:3])}）"
+            except Exception as e:
+                msg += f"；已有覆盖没载回（{e}），下次发布前会先存快照"
         state.BATCHES[B.batch] = B
+        state.SNAPS.pop(B.batch, None)
         state.DIRTY.add(B.batch)
-        self.report({"INFO"}, f"{B.batch}: {len(B.obj)} 个实例")
+        self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -73,6 +85,33 @@ class RENOU_OT_reset(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class RENOU_OT_restore_snapshot(bpy.types.Operator):
+    """把一份快照载回场景并发布（当前文件先存一份快照，载错了还能再换回来）"""
+    bl_idname = "renou.restore_snapshot"
+    bl_label = "载回"
+
+    batch: bpy.props.StringProperty()
+    path: bpy.props.StringProperty()
+
+    def execute(self, context):
+        B = state.BATCHES.get(self.batch)
+        if B is None:
+            self.report({"ERROR"}, f"{self.batch} 没有载入")
+            return {"CANCELLED"}
+        B.snapshot("before-restore")
+        try:
+            r = B.load_overrides(self.path)
+        except Exception as e:
+            self.report({"ERROR"}, f"载回失败：{e}")
+            return {"CANCELLED"}
+        state.SNAPS.pop(self.batch, None)
+        state.DIRTY.add(self.batch)
+        live.flush("restore snapshot")
+        miss = f"，找不到 GLB：{', '.join(r['missing_meshes'][:3])}" if r["missing_meshes"] else ""
+        self.report({"INFO"}, f"{self.batch}: 已载回 {r['instances']} 条覆盖、{r['meshes']} 个网格{miss}")
+        return {"FINISHED"}
+
+
 class RENOU_OT_write_back(bpy.types.Operator):
     """定稿：生成新版摆放表和改动说明（交工程发布，不覆盖任何旧文件）"""
     bl_idname = "renou.write_back"
@@ -91,7 +130,8 @@ class RENOU_OT_write_back(bpy.types.Operator):
         return {"FINISHED"}
 
 
-CLASSES = (RENOU_OT_attach, RENOU_OT_detach, RENOU_OT_publish_now, RENOU_OT_reset, RENOU_OT_write_back)
+CLASSES = (RENOU_OT_attach, RENOU_OT_detach, RENOU_OT_publish_now, RENOU_OT_reset, RENOU_OT_restore_snapshot,
+           RENOU_OT_write_back)
 
 
 def register():

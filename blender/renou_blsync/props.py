@@ -28,6 +28,9 @@ class RenouSyncSettings(bpy.types.PropertyGroup):
                             description="实时模式下多久收集一次改动")
     writeback_dir: StringProperty(name="写回目录", subtype="DIR_PATH",
                                   description="定稿时生成新版摆放表和改动说明的目录；不会覆盖任何旧文件")
+    resume: BoolProperty(name="接着已有覆盖继续", default=True,
+                         description="载入批时，覆盖文件里已经有的改动（挪、删、换件、新件）先载回场景，接着往下改；"
+                                     "关掉 = 从正式表重新开始（旧文件发布前会自动存快照）")
     live: BoolProperty(name="实时同步", default=False, update=_live_update,
                        description="开着时，脚本改的、手改的都自动发到 UE（对应 D5 LiveSync 的开始/暂停）")
 

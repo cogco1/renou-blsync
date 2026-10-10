@@ -15,7 +15,7 @@ class RENOU_PT_sync(bpy.types.Panel):
     def draw(self, context):
         s = state.settings(context)
         col = self.layout.column(align=True)
-        for p in ("placements", "parts_glb", "load_meshes", "only_src", "out", "status", "remote"):
+        for p in ("placements", "parts_glb", "load_meshes", "only_src", "out", "status", "remote", "resume"):
             col.prop(s, p)
         col.operator("renou.attach", icon="IMPORT")
         self.layout.separator()
@@ -67,6 +67,20 @@ class RENOU_PT_sync(bpy.types.Panel):
                 sub = box.box()
                 sub.label(text=f"材质槽 UE 没映射 {len(unmapped)} 个（显示斑马纹，请视效补表）：", icon="MATERIAL")
                 sub.label(text="，".join(unmapped[:6]) + ("…" if len(unmapped) > 6 else ""))
+            snaps = state.snapshots(name)
+            if snaps:
+                sub = box.box()
+                last = ue.get("snapshot") or r.get("snapshot") or snaps[0]["path"]
+                sub.label(text=f"快照（清空、整份改写、rev 回退前自动存）：最近 {last.replace(chr(92), '/').rsplit('/', 1)[-1][:60]}",
+                          icon="FILE_BACKUP")
+                for row in snaps:
+                    line = sub.row(align=True)
+                    t = row["time"]
+                    when = f"{t[4:6]}-{t[6:8]} {t[9:11]}:{t[11:13]}:{t[13:15]}" if len(t) >= 15 else t
+                    n = row["instances"] if row["instances"] is not None else "?"
+                    line.label(text=f"{when}  第 {row['rev']} 版  {n} 条  {row['reason']}")
+                    op = line.operator("renou.restore_snapshot", text="载回", icon="RECOVER_LAST")
+                    op.batch, op.path = name, row["path"]
             err = r.get("error") or ue.get("errors") or ue.get("error")
             if err:
                 row = box.row()

@@ -1104,15 +1104,99 @@ def attach(req, remember=True):
     return b.report
 
 
+ARCHIVE_KEEP = 50    # = renou_blsync_lib.ARCHIVE_KEEP
+
+
+def replace_risk(old, new):
+    """= renou_blsync_lib.replace_risk (user 10-10): why replacing override document old by new could lose work."""
+    if not old:
+        return None
+    oi, ni = old.get("instances") or {}, new.get("instances") or {}
+    if oi and not ni:
+        return "cleared"
+    if old.get("base_sha256") and new.get("base_sha256") and old["base_sha256"] != new["base_sha256"]:
+        return "base-changed"
+    try:
+        if float(new.get("rev")) < float(old.get("rev")):
+            return "rev-back"
+    except (TypeError, ValueError):
+        pass
+    gone = set(oi) - set(ni)
+    if gone:
+        return f"dropped{len(gone)}"
+    gm = set(old.get("meshes") or {}) - set(new.get("meshes") or {})
+    if gm:
+        return f"meshes-dropped{len(gm)}"
+    common = set(oi) & set(ni)
+    if len(common) >= 10 and sum(oi[k] != ni[k] for k in common) > len(common) / 2:
+        return "rewritten"
+    return None
+
+
+def _archive_dirs(path):
+    return [Path(path).parent / "archive", CTRL / "archive"]     # the second when the first is not writable
+
+
+def snapshot_raw(path, raw, reason):
+    """keep the bytes of the override file bl_sync applied last, before a version that shrinks or replaces it is applied
+    (whoever wrote it: the add-on keeps its own copies, scripts may not). Same naming and rotation as
+    renou_blsync_lib.snapshot_file: archive/<stem>__<yyyymmdd-hhmmss-mmm>__rev<rev>__<reason>.json, a copy identical to
+    the newest one is not made again, the newest ARCHIVE_KEEP stay. Returns the snapshot path or None."""
+    p = Path(path)
+    for d in _archive_dirs(path):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            olds = sorted(d.glob(f"{p.stem}__*.json"))
+            if olds and olds[-1].read_bytes() == raw:
+                return str(olds[-1])
+            try:
+                rev = json.loads(raw.decode("utf-8-sig")).get("rev")
+            except Exception:
+                rev = "unreadable"
+            t = time.time()
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(t)) + f"-{int(t * 1000) % 1000:03d}"
+            why = re.sub(r"[^0-9A-Za-z_-]+", "-", str(reason))[:40]
+            snap = d / f"{p.stem}__{stamp}__rev{rev}__{why}.json"
+            snap.with_suffix(".tmp").write_bytes(raw)
+            snap.with_suffix(".tmp").replace(snap)
+            for old in sorted(d.glob(f"{p.stem}__*.json"))[:-ARCHIVE_KEEP]:
+                old.unlink()
+            return str(snap)
+        except OSError:
+            continue
+    return None
+
+
+def latest_snapshot(path):
+    p, best = Path(path), None
+    for d in _archive_dirs(path):
+        fs = sorted(d.glob(f"{p.stem}__*.json")) if d.exists() else []
+        if fs and (best is None or fs[-1].name > best.name):
+            best = fs[-1]
+    return str(best) if best else None
+
+
 def apply_file(path, name=None):
-    ov = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    raw = Path(path).read_bytes()
+    ov = json.loads(raw.decode("utf-8-sig"))
     assert ov.get("schema") == "renou-overrides/1", ov.get("schema")
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
-    return _receipt(b, b.apply(ov))
+    prev, why = getattr(b, "file_prev", None), None
+    if prev and prev[0] == str(path):
+        why = replace_risk(prev[2], ov)
+        if why:
+            snapshot_raw(path, prev[1], why)
+    out = b.apply(ov)
+    b.file_prev = (str(path), raw, ov)
+    if why:
+        out["snapshot_made"] = why
+    return _receipt(b, out)
 
 
 def _receipt(b, out):
+    if getattr(b, "file_prev", None):
+        out["snapshot"] = latest_snapshot(b.file_prev[0])     # user 10-10: the receipt names the newest copy
     out["applied_at"] = time.time()
     if out.get("written"):
         out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)

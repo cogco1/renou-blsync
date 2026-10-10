@@ -32,6 +32,10 @@ def check(name, cond, info=""):
         fails.append(name)
 
 
+def list_snaps(ov):
+    return sorted((ov.parent / "archive").glob(ov.stem + "__*.json"))
+
+
 def receipt_ok(r):
     ue = r.get("ue") or {}
     return ue.get("rev") == r["rev"] and not ue.get("errors")
@@ -277,6 +281,71 @@ try:
           and not gltf.get("images") and not gltf.get("textures"))
     B.reset()
     B.publish("reset empty-slot addition", wait=10)
+
+    # user 10-10: no write that clears, shrinks or rewinds an override file without a snapshot first; a new Batch can go
+    # on from the file (or from any snapshot) instead of starting from the table
+    SO = out / "snap_overrides.json"
+    S1 = rb.Batch(P, out=SO, parts_glb=G, status=ST, track_edits=True)
+    s1b = S1.group("BLD_01")
+    S1.move(s1b, (7.0, 0.0, 0.0))
+    S1.delete(S1.group("BLK_BAKED")[:1])
+    S1.add_object(bpy.data.objects.new("snap_src", S1.meshes["PBOX_D"].copy()), "P0000000000a1")
+    S1.meshes["PBOX_D"].vertices[0].co.z += 0.25
+    S1.export_part("PBOX_D")
+    first = S1.publish("snapshot base", wait=0)
+    check("snapshots: the first file has nothing to keep", first.get("snapshot") is None and not list_snaps(SO), first)
+    S1.move(s1b, (1.0, 0.0, 0.0))
+    r = S1.publish("snapshot normal move", wait=0)
+    check("snapshots: a normal move (same ids) makes no snapshot", not list_snaps(SO), [p.name for p in list_snaps(SO)])
+    before = SO.read_bytes()
+    doc_before = json.loads(before)
+    S1.reset()
+    r = S1.publish("全部还原", wait=0)
+    snaps = list_snaps(SO)
+    check("snapshots: 全部还原 keeps the file it clears, byte for byte",
+          len(snaps) == 1 and snaps[0].read_bytes() == before and "__cleared" in snaps[0].name
+          and r.get("snapshot") == str(snaps[0]), [p.name for p in snaps])
+    rows = S1.snapshots()
+    check("snapshots: listed newest first with rev, reason and counts",
+          rows and rows[0]["reason"] == "cleared" and rows[0]["rev"] == str(doc_before["rev"])
+          and rows[0]["instances"] == len(doc_before["instances"]) and rows[0]["meshes"] == len(doc_before["meshes"]), rows[:1])
+    a1, a2 = S1.snapshot("again"), S1.snapshot("again2")
+    check("snapshots: an identical copy is not made twice", a1 == a2 and len(list_snaps(SO)) == 2, [p.name for p in list_snaps(SO)])
+    rd = rb.snapshot_file  # rotation with a small keep
+    tmpf = out / "rot_overrides.json"
+    for i in range(8):
+        tmpf.write_text(json.dumps({"rev": i, "instances": {}}), encoding="utf-8")
+        rd(tmpf, "test", keep=5)
+        time.sleep(0.01)
+    rot = sorted((out / "archive").glob("rot_overrides__*.json"))
+    check("snapshots: only the newest `keep` stay", len(rot) == 5 and json.loads(rot[0].read_text())["rev"] == 3,
+          [p.name for p in rot])
+
+    S2 = rb.Batch(P, out=SO, parts_glb=G, status=ST, track_edits=True)
+    check("snapshots: a new Batch never numbers below the file on disk", S2.rev >= json.loads(SO.read_text())["rev"])
+    orig_pbox = S2.meshes["PBOX_D"]
+    lr = S2.load_overrides(str(snaps[0]))
+    got = S2.overrides()
+    same_inst = set(got) == set(doc_before["instances"]) and all(
+        got[k].get("deleted") == v.get("deleted") and got[k].get("part") == v.get("part")
+        and (v.get("deleted") or max(abs(a - b) for a, b in zip(got[k]["pos"], v["pos"])) < 1e-4)
+        for k, v in doc_before["instances"].items())
+    check("load_overrides: a snapshot comes back exactly (moves, deletion, new object, edited mesh)",
+          same_inst and lr["missing_meshes"] == [] and set(S2.mesh_out) == set(doc_before["meshes"]), (lr, sorted(got)))
+    check("load_overrides: the loaded new part exports slot names only again", "P0000000000a1" in S2._slot_only_parts)
+    r = S2.publish("restored from snapshot", wait=0)
+    check("load_overrides: publishing the restored state writes the same instances and meshes",
+          set(json.loads(SO.read_text())["instances"]) == set(doc_before["instances"])
+          and set(json.loads(SO.read_text())["meshes"]) == set(doc_before["meshes"]), r)
+    S2.reset()
+    check("load_overrides: reset gives the release mesh back to a part the document had replaced",
+          S2.meshes["PBOX_D"] == orig_pbox and all(o.data == orig_pbox for o in S2.col.objects if o.get("blsync_part") == "PBOX_D"))
+    try:
+        S2.load_overrides(dict(doc_before, base_sha256="0" * 64))
+        check("load_overrides: refuses a document of another table version", False)
+    except ValueError:
+        check("load_overrides: refuses a document of another table version", True)
+    S2.publish("snapshot test done", wait=0)
 
     # Remote mode uses the real subprocess-based transport, but PATH can only
     # reach these local stand-ins. All data is synthetic; no server is involved.
