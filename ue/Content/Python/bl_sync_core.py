@@ -192,6 +192,27 @@ def glb_materials(glb):
     return out
 
 
+def glb_triangles(glb):
+    """triangle count from the GLB's JSON chunk (index or position accessor counts). StaticMesh.get_num_triangles() on a
+    freshly imported mesh waits for its Nanite build: 10.9 s of frozen editor for IC01 (5 M triangles, 400 MB, 10-10)."""
+    import struct
+    try:
+        with open(glb, "rb") as fh:
+            magic, _v, _n = struct.unpack("<4sII", fh.read(12))
+            clen, _t = struct.unpack("<II", fh.read(8))
+            g = json.loads(fh.read(clen))
+        acc, n = g.get("accessors", []), 0
+        for m in g.get("meshes", []):
+            for pr in m.get("primitives", []):
+                if pr.get("mode", 4) != 4:
+                    continue
+                a = pr.get("indices", pr.get("attributes", {}).get("POSITION"))
+                n += acc[a]["count"] // 3 if a is not None else 0
+        return n
+    except Exception:
+        return None
+
+
 def glb_material_names(glb):
     return list(glb_materials(glb))
 
@@ -512,12 +533,14 @@ class Batch:
             if want and got != want:
                 out.setdefault("errors", []).append(f"mesh {part}: sha {got[:12]} != {want[:12]} (file still being written?)")
                 continue
-            folder = f"{LIVE_ROOT}/{self.name}/{part}_{got[:8]}"     # R3: preview assets apart, never in a batch folder
             gm = glb_materials(glb)
             textured = {_norm(n) for n, tex in gm.items() if tex}
             self.textured_now = textured
             need_mats = self.needs_glb_materials(list(gm), self.meshes.get(part.lower()))
-            job = {"folder": folder, "sha": got, "textured": textured, "need_mats": need_mats}
+            # R3: preview assets apart, never in a batch folder. One folder per part, GLB content and material choice,
+            # shared by every batch: the north slope (10-10) sent the same part to three batches, imported three times
+            folder = f"{LIVE_ROOT}/_parts/{part}_{got[:8]}{'_m' if need_mats else ''}"
+            job = {"folder": folder, "sha": got, "textured": textured, "need_mats": need_mats, "triangles": glb_triangles(glb)}
             rec = _ASYNC.get(folder)
             if rec is not None and rec["state"] == "failed":
                 if time.time() - rec["done_t"] < 60:
@@ -596,7 +619,7 @@ class Batch:
             self.keypath[new.get_path_name()] = self.keypath.get(op, op)
         self.meshes[part.lower()] = new
         self.mesh_sha[part] = got
-        tri = new.get_num_triangles(0) if hasattr(new, "get_num_triangles") else None
+        tri = job.get("triangles")                 # from the GLB: asking the new mesh would wait for its Nanite build
         row = {"part": part, "new_part": old is None, "hism_switched": swapped, "glb_materials": need_mats,
                "slots": slots if old else None, "asset": new.get_path_name(), "triangles": tri}
         if timing.get("done_t"):                    # asynchronous: time in the queue and in Interchange
@@ -1003,7 +1026,7 @@ class GroundBatch(Batch):
             slots = self.carry_materials(comp, cur, sms[0])
             self.mesh_sha[tid] = got
             out.setdefault("meshes", []).append({"tile": tid, "glb_materials": need, "slots": slots,
-                                                  "triangles": sms[0].get_num_triangles(0), "seconds": round(time.time() - t, 2)})
+                                                  "triangles": glb_triangles(glb), "seconds": round(time.time() - t, 2)})
 
     def revert_meshes(self, keep, out):
         for tid in [k for k in self.mesh_sha if k not in keep]:
