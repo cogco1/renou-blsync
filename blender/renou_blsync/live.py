@@ -137,6 +137,8 @@ def flush(label="live"):
     sent = []
     for name in list(state.DIRTY):
         B = state.BATCHES.get(name)
+        if name in state.BLOCKED:                        # Ash 10-10: never publish a batch whose file did not load back
+            continue
         state.DIRTY.discard(name)
         if B is None:
             continue

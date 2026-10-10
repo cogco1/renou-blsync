@@ -27,18 +27,23 @@ class RENOU_OT_attach(bpy.types.Operator):
         if B.batch in state.BATCHES:
             self.report({"WARNING"}, f"{B.batch} 已载入过，新载入的这一份替换旧的")
         msg = f"{B.batch}: {len(B.obj)} 个实例"
-        doc = B.read_out() if s.resume else None
-        if doc and (doc.get("instances") or doc.get("meshes")):
+        state.BLOCKED.pop(B.batch, None)
+        on_disk = B.out.exists()
+        doc = B.read_out() if s.resume and on_disk else None
+        if s.resume and on_disk and doc is None:
+            state.BLOCKED[B.batch] = "覆盖文件读不了（损坏？）"
+        elif doc and (doc.get("instances") or doc.get("meshes")):
             # user 10-10: reattaching (a reopened window) goes on from the file instead of overwriting it with the table
             try:
                 r = B.load_overrides(doc)
                 msg += f"，接着已有覆盖：{r['instances']} 条，网格 {r['meshes']} 个"
-                if r["missing_meshes"]:
-                    msg += f"（找不到 GLB：{', '.join(r['missing_meshes'][:3])}）"
-            except Exception as e:
-                msg += f"；已有覆盖没载回（{e}），下次发布前会先存快照"
+            except Exception as e:                       # all or nothing: the scene is still the table
+                state.BLOCKED[B.batch] = f"已有覆盖没载回：{e}"
         state.BATCHES[B.batch] = B
         state.SNAPS.pop(B.batch, None)
+        if B.batch in state.BLOCKED:                     # Ash 10-10: nothing is published until the user decides
+            self.report({"WARNING"}, f"{msg}；{state.BLOCKED[B.batch]}。这一批暂不发布：在面板里重试载回，或从正式表开始")
+            return {"FINISHED"}
         state.DIRTY.add(B.batch)
         self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -98,17 +103,32 @@ class RENOU_OT_restore_snapshot(bpy.types.Operator):
         if B is None:
             self.report({"ERROR"}, f"{self.batch} 没有载入")
             return {"CANCELLED"}
-        B.snapshot("before-restore")
         try:
-            r = B.load_overrides(self.path)
+            B.snapshot("before-restore")                 # the file on disk ...
+            B.snapshot_scene("before-restore")           # ... and the scene, unpublished edits included (Ash 10-10)
+            r = B.load_overrides(self.path)              # all or nothing
         except Exception as e:
-            self.report({"ERROR"}, f"载回失败：{e}")
+            self.report({"ERROR"}, f"载回失败，场景没动：{e}")
             return {"CANCELLED"}
+        state.BLOCKED.pop(self.batch, None)
         state.SNAPS.pop(self.batch, None)
         state.DIRTY.add(self.batch)
         live.flush("restore snapshot")
-        miss = f"，找不到 GLB：{', '.join(r['missing_meshes'][:3])}" if r["missing_meshes"] else ""
-        self.report({"INFO"}, f"{self.batch}: 已载回 {r['instances']} 条覆盖、{r['meshes']} 个网格{miss}")
+        self.report({"INFO"}, f"{self.batch}: 已载回 {r['instances']} 条覆盖、{r['meshes']} 个网格")
+        return {"FINISHED"}
+
+
+class RENOU_OT_unblock(bpy.types.Operator):
+    """不载回已有覆盖，从正式表开始发布（发布前旧文件会自动存快照）"""
+    bl_idname = "renou.unblock"
+    bl_label = "从正式表开始"
+
+    batch: bpy.props.StringProperty()
+
+    def execute(self, context):
+        state.BLOCKED.pop(self.batch, None)
+        state.DIRTY.add(self.batch)
+        self.report({"INFO"}, f"{self.batch}: 从正式表开始；旧文件在发布前存进 archive/")
         return {"FINISHED"}
 
 
@@ -131,7 +151,7 @@ class RENOU_OT_write_back(bpy.types.Operator):
 
 
 CLASSES = (RENOU_OT_attach, RENOU_OT_detach, RENOU_OT_publish_now, RENOU_OT_reset, RENOU_OT_restore_snapshot,
-           RENOU_OT_write_back)
+           RENOU_OT_unblock, RENOU_OT_write_back)
 
 
 def register():

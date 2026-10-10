@@ -22,6 +22,7 @@ import unreal
 import bl_sync_core as core
 
 REQ = globals().get("REQUEST", {}) or {}
+FRAME_TAG = "BLSYNC_FRAME_CAM"                        # cameras made by "frame" (the only ones it moves or removes)
 act = REQ.get("action", "status")
 if act == "reload":                                   # first: the cached core may be older than this file
     try:
@@ -104,9 +105,11 @@ elif act == "materials":
 elif act == "where":
     REPORT = core.where(REQ["name"], REQ["inst"])
 elif act == "frame" and REQ.get("remove"):            # remove the temporary camera this script made (test views only)
+    # only cameras frame made (tag BLSYNC_FRAME_CAM): Ash 10-10, a camera of 视效's with the same label must stay
     EAS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     label = "CAM_" + REQ.get("cam", "BLSYNC")
-    gone = [a for a in EAS.get_all_level_actors() if isinstance(a, unreal.CineCameraActor) and a.get_actor_label() == label]
+    gone = [a for a in EAS.get_all_level_actors() if isinstance(a, unreal.CineCameraActor) and a.get_actor_label() == label
+            and FRAME_TAG in [str(t) for t in a.tags]]
     EAS.destroy_actors(gone)
     REPORT = {"removed": len(gone)}
 elif act == "frame":
@@ -123,11 +126,12 @@ elif act == "frame":
     loc = c - d * r
     EAS = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
     label = "CAM_" + REQ.get("cam", "BLSYNC")
-    cam = next((a for a in EAS.get_all_level_actors()
-                if isinstance(a, unreal.CineCameraActor) and a.get_actor_label() == label), None)
-    if cam is None:
+    cam = next((a for a in EAS.get_all_level_actors() if isinstance(a, unreal.CineCameraActor)
+                and a.get_actor_label() == label and FRAME_TAG in [str(t) for t in a.tags]), None)
+    if cam is None:                                    # never moves a camera this script did not make
         cam = EAS.spawn_actor_from_class(unreal.CineCameraActor, loc, unreal.Rotator(0, 0, 0))
         cam.set_actor_label(label)
+        cam.set_editor_property("tags", [unreal.Name(FRAME_TAG)])
     cam.set_actor_location_and_rotation(loc, unreal.Rotator(roll=0.0, pitch=pitch, yaw=yaw), False, True)
     cc = cam.get_cine_camera_component()
     cc.set_editor_property("current_focal_length", float(REQ.get("focal", 24.0)))
