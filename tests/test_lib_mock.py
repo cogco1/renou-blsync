@@ -2,7 +2,7 @@
     blender -b --factory-startup --python-exit-code 1 --python tests/test_lib_mock.py -- build
 Builds the synthetic fixture (tests/make_fixture.py), starts tests/mock_ue_receiver.py with Blender's own Python, then
 drives the library the way an engineering script would. Prints PASS/FAIL per check; exit code 0 = everything passed."""
-import hashlib, json, os, shlex, shutil, struct, subprocess, sys, time, traceback
+import hashlib, json, math, os, shlex, shutil, struct, subprocess, sys, time, traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,9 +42,58 @@ def receipt_ok(r):
 
 
 try:
+    # #31 / Ash 10-10: rotation comparison in double precision with an angle tolerance
+    import random
+    random.seed(32)
+    bad_same, bad_neg, bad_r7, bad_mat, detected = 0, 0, 0, 0, 0
+    for _ in range(10000):
+        q = Quaternion([random.gauss(0, 1) for _ in range(4)])
+        q.normalize()
+        bad_same += not rb.same_rotation(q, q)
+        bad_neg += not rb.same_rotation(q, -q)
+        r7 = [round(v, 7) for v in q]
+        bad_r7 += not rb.same_rotation(q, Quaternion(r7))
+        _l, q2, _s = Matrix.LocRotScale(Vector((4000.0, -3500.0, 120.0)), Quaternion(r7), Vector((1.3, 1.3, 1.3))).decompose()
+        bad_mat += not rb.same_rotation(Quaternion(r7), q2)
+        axis = Vector([random.gauss(0, 1) for _ in range(3)]).normalized()
+        detected += not rb.same_rotation(q, Quaternion(axis, math.radians(0.01)) @ q)
+    check("same_rotation: 10,000 random rotations equal to themselves, to -q, to 7 decimals and after a matrix round trip",
+          bad_same == bad_neg == bad_r7 == bad_mat == 0, (bad_same, bad_neg, bad_r7, bad_mat))
+    check("same_rotation: a 0.01 deg turn about any axis is a change", detected == 10000, detected)
+    ash = Quaternion((0.012953181751072407, -0.532923698425293, 0.8209651708602905, 0.20455056428909302))
+    check("same_rotation: Ash's float32 example is the same rotation", rb.same_rotation(ash, ash) and rb.rotation_angle(ash, ash) == 0.0)
+
     # fast mode: Empties only, part bounds read from the GLB header
     Bf = rb.Batch(P, out=out / "fast_overrides.json", parts_glb=G, status=ST, load_meshes=False)
     check("fast mode baseline: no overrides, also for the w = 0 row (#31)", Bf.overrides() == {}, list(Bf.overrides())[:3])
+    # Ash 10-10 (#33): a receipt is only taken when it is this batch's
+    rd = out / "receipt_identity"
+    rd.mkdir()
+    Bf.status = rd / "status.json"
+    own_f, shared_f = rd / f"status_{Bf.batch}.json", rd / "status.json"
+    def put(f, d):
+        f.write_text(json.dumps(d), encoding="utf-8")
+    now = time.time()
+    put(own_f, {"batch": Bf.batch, "rev": 122})
+    put(shared_f, {"batch": "OTHER", "rev": 123, "counts": {"moved": 999}})
+    check("receipts: another batch's receipt with my rev in the shared file is not mine",
+          Bf.wait_receipt({"rev": 123, "written": now}, wait=0.3) is None)
+    put(shared_f, {"rev": 123, "counts": {"moved": 999}})
+    check("receipts: a shared receipt that names no batch is not believed", Bf.wait_receipt({"rev": 123, "written": now}, wait=0.3) is None)
+    put(shared_f, {"batch": "OTHER", "error": "theirs", "t": now + 5})
+    check("receipts: another batch's error is not mine", Bf.wait_receipt({"rev": 123, "written": now}, wait=0.3) is None)
+    put(shared_f, {"batch": Bf.batch, "error": "mine", "t": now + 5})
+    got = Bf.wait_receipt({"rev": 123, "written": now}, wait=1)
+    check("receipts: my own error (newer than the file) is returned", got and got.get("error") == "mine", got)
+    put(shared_f, {"batch": "OTHER", "rev": 124})
+    put(own_f, {"batch": Bf.batch, "rev": 124, "counts": {"moved": 1}})
+    got = Bf.wait_receipt({"rev": 124, "written": now}, wait=1)
+    check("receipts: two batches with the same rev each get their own", got and got.get("counts") == {"moved": 1}, got)
+    put(own_f, {"rev": 125})
+    check("receipts: an old bl_sync receipt without batch is believed from the batch's own file",
+          (Bf.wait_receipt({"rev": 125, "written": now}, wait=1) or {}).get("rev") == 125)
+    Bf.status = ST
+
     c = Bf.centre(Bf.group("BLK_BAKED"), base=False)
     check("fast mode: world-baked block centre from the GLB header", (c - Vector((110, 60, 20))).length < 1e-3, tuple(c))
 
