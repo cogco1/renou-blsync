@@ -159,6 +159,16 @@ try:
     bpy.context.view_layer.update()
     state.DIRTY.discard("test_01")
     target = state.rb.list_snapshots(OV, limit=200)[-1]["path"]
+    em = next(o for o in B3.col.objects if o.type == "MESH")
+    bpy.context.view_layer.objects.active = em
+    em.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        refused_in_edit = bpy.ops.renou.restore_snapshot(batch="test_01", path=target) == {"CANCELLED"}
+    except RuntimeError:                                 # the operator reports ERROR -> raised in background mode
+        refused_in_edit = True
+    bpy.ops.object.mode_set(mode="OBJECT")
+    check("restore refuses in edit mode (edits there are not in the mesh, the backup would miss them)", refused_in_edit)
     check("restore operator keeps the unpublished scene first", bpy.ops.renou.restore_snapshot(batch="test_01", path=target) == {"FINISHED"})
     scene_snaps = [s for s in state.rb.list_snapshots(OV, limit=200)
                    if "scene before" in json.loads(Path(s["path"]).read_text(encoding="utf-8")).get("label", "")]

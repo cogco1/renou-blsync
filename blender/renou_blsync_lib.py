@@ -587,8 +587,9 @@ class Batch:
         in `out` when the add-on attaches again (user 10-10: reopening a window must not start from an empty file).
         Everything goes back to the table first, then each listed instance is placed as listed; part meshes come from
         the document's GLBs. Ash 10-10, all or nothing: the document, every GLB (present - as written or in <out>/meshes -,
-        its SHA-256 equal to the document's, importable) is checked and imported BEFORE the scene changes; anything wrong
-        raises and leaves the scene as it was. Returns {"instances", "meshes", "missing_meshes": []}. Main thread."""
+        its SHA-256 equal to the document's, importable) and every instance entry (its transform computed, finite) are
+        checked BEFORE the scene changes; anything wrong raises and leaves the scene as it was. After that only plain
+        assignments are made. Returns {"instances", "meshes", "missing_meshes": []}. Main thread."""
         doc = src if isinstance(src, dict) else json.loads(Path(src).read_text(encoding="utf-8-sig"))
         if doc.get("schema") != "renou-overrides/1" or doc.get("batch") != self.batch:
             raise ValueError(f"not an override document of {self.batch}: {doc.get('schema')} / {doc.get('batch')}")
@@ -604,6 +605,7 @@ class Batch:
                 if m.get("sha256") and got != m["sha256"]:
                     raise ValueError(f"mesh {part}: {glb.name} has SHA-256 {got[:12]}, the document says {m['sha256'][:12]}")
                 staged[part] = (glb, got, self._import_part_mesh(glb, part + "__staged"))
+            plan = self._plan_instances(doc.get("instances") or {})
         except Exception:
             for _glb, _got, me in staged.values():
                 bpy.data.meshes.remove(me)
@@ -624,25 +626,23 @@ class Batch:
         for o in self.col.objects:                       # table objects of a replaced part show the loaded mesh
             if o.type == "MESH" and o.get("blsync_part") in self.mesh_out and o.get("blsync_part") in self.meshes:
                 o.data = self.meshes[o["blsync_part"]]
-        for iid, e in (doc.get("instances") or {}).items():
-            rec = self.base.get(iid)
-            if rec is not None:
-                o = self.obj.get(iid)
-                if o is None or not alive(o) or o.name not in self.col.objects:
-                    o = self._spawn(iid)
-                if e.get("deleted"):
-                    self.delete([o])
-                    continue
-                if e.get("part") and e["part"] != rec["part"]:
-                    self.set_part([o], e["part"])
-                o.matrix_world = mat_of(dict(rec, **e))
-            elif not e.get("deleted"):
-                part = e.get("part")
+        for iid, kind, part, M, e in plan:
+            if kind == "new":
                 o = bpy.data.objects.new(iid, self.meshes.get(part))
                 o["blsync_id"], o["blsync_part"] = iid, part
-                o["blsync_era"], o["blsync_src"] = e.get("era", "both"), e.get("src", "")
-                o.matrix_world = mat_of(e)
+                o["blsync_era"], o["blsync_src"] = str(e.get("era", "both")), str(e.get("src", ""))
+                o.matrix_world = M
                 self.col.objects.link(o)
+                continue
+            o = self.obj.get(iid)
+            if o is None or not alive(o) or o.name not in self.col.objects:
+                o = self._spawn(iid)
+            if kind == "delete":
+                self.delete([o])
+                continue
+            if part != self.base[iid]["part"]:
+                self.set_part([o], part)
+            o.matrix_world = M
         try:
             self.rev = max(self.rev, int(float(doc.get("rev"))))
         except (TypeError, ValueError):
@@ -651,10 +651,43 @@ class Batch:
         return {"instances": len(doc.get("instances") or {}), "meshes": len(doc.get("meshes") or {}),
                 "missing_meshes": []}
 
+    def _plan_instances(self, entries):
+        """every entry of a document checked, its object kind, part and world matrix computed - before load_overrides()
+        changes anything (Ash 10-10: a bad value in a late entry used to fail after the reset). Raises ValueError."""
+        plan = []
+        for iid, e in entries.items():
+            try:
+                if not isinstance(iid, str) or not isinstance(e, dict):
+                    raise ValueError("entry is not an object")
+                rec = self.base.get(iid)
+                if e.get("deleted"):
+                    if rec is not None:
+                        plan.append((iid, "delete", None, None, e))
+                    continue                         # a new instance marked deleted: nothing to show
+                part = e.get("part") if e.get("part") is not None else (rec or {}).get("part")
+                if not isinstance(part, str) or not part:
+                    raise ValueError("no part")
+                M = mat_of(dict(rec, **e) if rec is not None else e)
+                if not all(math.isfinite(v) for row in M for v in row):
+                    raise ValueError("transform is not finite")
+                plan.append((iid, "table" if rec is not None else "new", part, M, e))
+            except Exception as exc:
+                raise ValueError(f"instance {iid}: {type(exc).__name__}: {exc}") from exc
+        return plan
+
     def snapshot_scene(self, reason="scene"):
         """keep the scene's current state (unpublished edits included) in archive/ as an override document - before a
         restore replaces it (Ash 10-10: the file on disk may not hold the newest edits). Part meshes edited but not yet
-        exported are not in it (their GLBs do not exist yet)."""
+        exported are exported first (Ash 10-10: otherwise a restore loses unpublished geometry): with track_edits every part
+        whose mesh changed since load / last export, without it the parts already sent (they may have been edited
+        since). Object mode only (edit-mode changes are not in the mesh yet)."""
+        if bpy.context.mode != "OBJECT":
+            raise RuntimeError("leave edit mode first: edits made there are not in the mesh yet")
+        for part in list(self.meshes if self._sig else self.mesh_out):
+            if self._sig:
+                self.export_part_if_changed(part)
+            else:
+                self.export_part(part)
         doc = {"schema": "renou-overrides/1", "batch": self.batch, "base_sha256": self.base_sha, "rev": self.rev,
                "label": f"scene before {reason} (unpublished edits included)", "written": time.time(),
                "instances": self.overrides(),
