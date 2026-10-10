@@ -350,15 +350,18 @@ class Batch:
     def needs_glb_materials(self, names, old_mesh):
         """True when some slot of the new mesh would end on "keep" (KEEP_GLB) with nothing in UE to show for it."""
         old = {_norm(n) for n in slot_names(old_mesh)} if old_mesh else set()
-        for n in names:
-            k = _norm(n)
-            if k in old:
-                continue
-            m, how = self.ue_material(n)
-            if how in ("keep", "keep_textured"):
-                return True
-        self.unmapped -= {n for n in names}         # ue_material() above only looked; the real assignment reports again
-        return False
+        seen = set(self.unmapped)                   # ue_material() below only looks: what it adds is taken back, and
+        try:                                        # nothing reported for other meshes is dropped (Ash 10-10)
+            for n in names:
+                k = _norm(n)
+                if k in old:
+                    continue
+                m, how = self.ue_material(n)
+                if how in ("keep", "keep_textured"):
+                    return True
+            return False
+        finally:
+            self.unmapped = seen
 
     def carry_materials(self, comp, old_mesh, new_mesh):
         """switch comp to new_mesh; a slot with the same name as on the old mesh keeps exactly the material UE showed
@@ -367,9 +370,12 @@ class Batch:
         self.textured_now = getattr(self, "textured_by_mesh", {}).get(new_mesh.get_path_name(), set())
         comp.set_static_mesh(new_mesh)
         rep = {}
+        ph = PLACEHOLDER.split(".")[0]
         for j, n in enumerate(slot_names(new_mesh)):
             m = before.get(_norm(n))
             how = "carried"
+            if m is not None and m.get_path_name().split(".")[0] == ph:
+                m = None                            # a placeholder is not UE's material: resolve again, report if still none
             if m is None:
                 m, how = self.ue_material(n)
             if m is not None:
