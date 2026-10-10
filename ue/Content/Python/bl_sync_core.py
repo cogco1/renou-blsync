@@ -936,16 +936,29 @@ def apply_file(path, name=None):
     b = S["batches"].get(name) if name else next((x for x in S["batches"].values() if x.data.get("batch") == ov.get("batch")), None)
     assert b is not None, f"batch {ov.get('batch')} not attached"
     out = b.apply(ov)
+    out["batch"] = ov.get("batch") or b.name      # Ash 10-10: every receipt says whose it is (rev alone can collide)
+    out["file"] = str(path)
     out["applied_at"] = time.time()
     if out.get("written"):
         out["latency_s"] = round(out["applied_at"] - float(out["written"]), 3)
-    body = json.dumps(out, ensure_ascii=False)
-    (CTRL / "status.tmp").write_text(body, encoding="utf-8")
-    (CTRL / "status.tmp").replace(CTRL / "status.json")      # the last receipt of any batch (kept for old readers)
-    one = CTRL / f"status_{ov.get('batch') or b.name}.json"   # one receipt per batch: two writers never mix receipts
-    one.with_suffix(".tmp").write_text(body, encoding="utf-8")
-    one.with_suffix(".tmp").replace(one)
+    write_receipt(out["batch"], out)
     return out
+
+
+def write_receipt(batch, body):
+    """status_<batch>.json (the batch's own receipt) and status.json (the last receipt of any batch, for old readers);
+    both carry "batch", so a reader can check it is reading its own."""
+    text = json.dumps(dict(body, batch=batch), ensure_ascii=False)
+    for f in ([CTRL / f"status_{batch}.json"] if batch else []) + [CTRL / "status.json"]:
+        f.with_suffix(".tmp").write_text(text, encoding="utf-8")
+        f.with_suffix(".tmp").replace(f)
+
+
+def _file_batch(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8-sig")).get("batch")
+    except Exception:
+        return None
 
 
 def _watch_tick(dt):
@@ -968,7 +981,7 @@ def _watch_tick(dt):
         except Exception:
             err = traceback.format_exc()
             unreal.log_error("[BLSYNC] " + err)
-            (CTRL / "status.json").write_text(json.dumps({"error": err, "file": path, "t": time.time()}), encoding="utf-8")
+            write_receipt(_file_batch(path), {"error": err, "file": path, "t": time.time()})
 
 
 def watch(paths, interval=0.2):
