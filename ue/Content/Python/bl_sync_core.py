@@ -41,6 +41,10 @@ GUARD = CTRL / "guard.json"
 LIVE_ROOT = "/Game/_LivePreview"        # single-part re-imports (in memory; if someone saves them they stay in this folder)   # name -> Batch; watch = {"path", "sig", "handle", "next", "interval"}
 
 
+# = renou_blsync_lib.OPTIONAL_FIELDS (协调 10-10): optional row fields of renou-placements/1. bl_sync keeps them per
+# instance (where() reports them) and never needs them; any other unknown field of a row is ignored.
+OPTIONAL_FIELDS = ("layer", "recipe", "group", "pair", "event", "lock", "tags")
+
 _MI = {}
 
 
@@ -330,7 +334,11 @@ class Batch:
         self.level_files = sorted({level_file(a) for a in self.hosts.values()} - {None})
         # same grouping as ct_placements step 2: per (era, mesh) in table order -> instance index in that HISM
         self.base, self.home, counter, skipped = {}, {}, {}, 0
+        self.meta = {}                              # id -> optional placements fields (layer, group, lock ...)
         for inst in self.data.get("instances", []):
+            m = {k: inst[k] for k in OPTIONAL_FIELDS if k in inst}
+            if m:
+                self.meta[inst["id"]] = m
             st = norm_state(inst)
             m = self.mesh_for(inst["part"], inst.get("lods"))
             if m is None:
@@ -705,7 +713,12 @@ class Batch:
         self.revert_meshes(set(ov.get("meshes") or {}), out)
         self.update_meshes(ov.get("meshes"), out)
         new = {}
+        meta = getattr(self, "meta", None)
         for iid, d in (ov.get("instances") or {}).items():
+            if meta is not None and iid not in self.base:   # a new instance's optional fields come in its entry
+                m = {k: d[k] for k in OPTIONAL_FIELDS if k in d}
+                if m:
+                    meta[iid] = m
             b = self.base.get(iid)
             merged = dict({"part": b["part"], "era": b["era"], "pos": b["pos"], "quat_wxyz": b["quat"], "scale": b["scale"]} if b else {}, **d)
             new[iid] = norm_state(merged)
@@ -830,6 +843,8 @@ class VegBatch(Batch):
                 index[(round(t.x), round(t.y), round(t.z))] = (key, i)
         default_era = self.data.get("era", "both")
         self.base, self.home, votes = {}, {}, {}
+        self.meta = {i["id"]: {k: i[k] for k in OPTIONAL_FIELDS if k in i} for i in self.data.get("instances", [])
+                     if any(k in i for k in OPTIONAL_FIELDS)}
         missing, bad, worst, checked = 0, 0, 0.0, 0
         near = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
         for n, inst in enumerate(self.data.get("instances", [])):
@@ -1546,8 +1561,12 @@ def where(name, iid):
     comp = b.comps[key]
     t = comp.get_instance_transform(idx, True)
     c = t.transform_location(comp.get_editor_property("static_mesh").get_bounds().origin)
-    return {"centre_m": [round(c.x / 100, 3), round(-c.y / 100, 3), round(c.z / 100, 3)],
-            "yaw_ue": round(t.rotation.rotator().yaw, 3), "scale": [round(v, 4) for v in (t.scale3d.x, t.scale3d.y, t.scale3d.z)]}
+    out = {"centre_m": [round(c.x / 100, 3), round(-c.y / 100, 3), round(c.z / 100, 3)],
+           "yaw_ue": round(t.rotation.rotator().yaw, 3), "scale": [round(v, 4) for v in (t.scale3d.x, t.scale3d.y, t.scale3d.z)]}
+    m = getattr(b, "meta", {}).get(iid)
+    if m:
+        out["meta"] = m                             # the row's optional fields (layer, group, lock ...)
+    return out
 
 
 # ---------------------------------------------------------------- control channel (own file, not 视效's lk_session)

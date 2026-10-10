@@ -478,6 +478,66 @@ try:
     check("snapshot_scene: the scene (unpublished edits included) is kept as an override document",
           scdoc["instances"] == json.loads(before) and "__test__" in Path(sc).name, Path(sc).name)
 
+    # 10-10: optional placements fields (layer, recipe, group, pair, event, lock, tags) and unknown fields pass through
+    F3 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
+    b5 = F3.where(layer="L3")
+    check("optional fields: where(layer=...) finds the 4 rows that carry it", len(b5) == 4, len(b5))
+    check("optional fields: group() also matches the group field", set(F3.group("g012")) == set(b5))
+    check("optional fields: where(tags=...) matches one tag of the list, where(lock=...) reads proc / hand",
+          set(F3.where(tags="nocol")) == set(b5) and not F3.where(lock="hand") and set(F3.where(lock="proc")) >= set(b5))
+    want_meta = {"layer": "L3", "recipe": "F_QUAY_LOAD", "group": "g012", "event": "E-H3-1", "lock": "proc",
+                 "tags": ["clutter", "nocol"]}
+    m0 = F3.meta(b5[0])
+    check("optional fields: carried on the object", {k: m0.get(k) for k in want_meta} == want_meta and m0["pair"].startswith("past_"), m0)
+    check("optional fields: is_locked reads hand / true / proc",
+          rb.is_locked({"lock": "hand"}) and rb.is_locked({"lock": True}) and not rb.is_locked({"lock": "proc"})
+          and not rb.is_locked({}))
+    F3.move(b5[:1], (2.0, 0.0, 0.0))
+    cp = F3.copy(b5[1:2], (0.0, 40.0, 0.0))[0]
+    wb = F3.write_back(out / "fields_wb")
+    tab = json.loads(Path(wb["placements"]).read_text(encoding="utf-8"))
+    rows = {r["id"]: r for r in tab["instances"]}
+    base_rows = {r["id"]: r for r in json.loads(P.read_text(encoding="utf-8"))["instances"]}
+    moved = rows[b5[0]["blsync_id"]]
+    check("write_back: a moved row keeps every optional field and gets lock = hand",
+          {k: moved.get(k) for k in want_meta if k != "lock"} == {k: v for k, v in want_meta.items() if k != "lock"}
+          and moved["lock"] == "hand" and moved["pair"] == base_rows[b5[0]["blsync_id"]]["pair"], moved)
+    added = rows[cp["blsync_id"]]
+    check("write_back: a copy keeps its source's layer / group / tags (not its pair) and gets lock = hand",
+          added.get("layer") == "L3" and added.get("group") == "g012" and added.get("tags") == ["clutter", "nocol"]
+          and added.get("lock") == "hand" and "pair" not in added, added)
+    fut = next(r for r in base_rows.values() if "x_future" in r)
+    check("write_back: untouched rows stay identical, unknown fields included",
+          rows[fut["id"]] == fut and rows[b5[2]["blsync_id"]] == base_rows[b5[2]["blsync_id"]])
+    # Ash 10-10 on #39: a new / copied instance's optional fields travel in the override, so a reload keeps them
+    sd = b5[2].copy()                                    # what Shift+D does: same id, same custom properties
+    F3.col.objects.link(sd)
+    sd.location.y += 60.0
+    F3.fix_duplicates()
+    ovs = F3.overrides()
+    keep_meta = {"layer": "L3", "recipe": "F_QUAY_LOAD", "group": "g012", "event": "E-H3-1", "tags": ["clutter", "nocol"]}
+    check("meta: a copy's override entry carries its layer / recipe / group / event / tags, not pair or lock",
+          all({k: ovs[o["blsync_id"]].get(k) for k in keep_meta} == keep_meta and "pair" not in ovs[o["blsync_id"]]
+              and "lock" not in ovs[o["blsync_id"]] for o in (cp, sd)), {k: ovs[cp["blsync_id"]].get(k) for k in ("layer", "pair", "lock")})
+    F3.publish("meta travels", wait=0)
+    F4 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
+    F4.load_overrides(F4.read_out())
+    back = {o["blsync_id"]: F4.meta(o) for o in F4.col.objects if o.get("blsync_id") in (cp["blsync_id"], sd["blsync_id"])}
+    check("meta: after a reload (new Batch + load_overrides) both copies have their fields again",
+          len(back) == 2 and all({k: m.get(k) for k in keep_meta} == keep_meta for m in back.values()), back)
+    wb4 = {r["id"]: r for r in json.loads(Path(F4.write_back(out / "fields_wb4")["placements"]).read_text(encoding="utf-8"))["instances"]}
+    check("meta: write_back after the reload writes them into the new rows, lock = hand",
+          all({k: wb4[i].get(k) for k in keep_meta} == keep_meta and wb4[i]["lock"] == "hand" and "pair" not in wb4[i] for i in back),
+          {i: {k: wb4[i].get(k) for k in ("layer", "group", "lock")} for i in back})
+    snapb = F4.snapshot_scene("meta-check")
+    F5 = rb.Batch(P, out=out / "fields_overrides.json", parts_glb=G, status=ST)
+    F5.load_overrides(str(snapb))
+    check("meta: a snapshot restore keeps them too",
+          all({k: F5.meta(o).get(k) for k in keep_meta} == keep_meta for o in F5.col.objects if o.get("blsync_id") in back))
+    wb2 = F3.write_back(out / "fields_wb", lock_edits=False)
+    check("write_back(lock_edits=False) leaves lock as it was",
+          {r["id"]: r for r in json.loads(Path(wb2["placements"]).read_text(encoding="utf-8"))["instances"]}[b5[0]["blsync_id"]]["lock"] == "proc")
+
     # Remote mode uses the real subprocess-based transport, but PATH can only
     # reach these local stand-ins. All data is synthetic; no server is involved.
     original_path = os.environ.get("PATH")
