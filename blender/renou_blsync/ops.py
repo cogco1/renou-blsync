@@ -103,6 +103,9 @@ class RENOU_OT_restore_snapshot(bpy.types.Operator):
         if B is None:
             self.report({"ERROR"}, f"{self.batch} 没有载入")
             return {"CANCELLED"}
+        if context.mode != "OBJECT":                     # edit-mode changes are not in the mesh yet (Ash 10-10)
+            self.report({"ERROR"}, "先退出编辑模式再载回：编辑模式里的改动还没写进网格，备份会漏掉")
+            return {"CANCELLED"}
         try:
             B.snapshot("before-restore")                 # the file on disk ...
             B.snapshot_scene("before-restore")           # ... and the scene, unpublished edits included (Ash 10-10)
