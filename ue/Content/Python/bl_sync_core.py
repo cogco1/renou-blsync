@@ -330,8 +330,11 @@ class Batch:
         self.mesh_orig = {}                         # part -> the batch's own mesh (to switch back on reset)
         self.pending, self.last_ov = {}, None       # #28: part -> async import it waits for; the last override applied
         self.sync_import = bool(req.get("sync_import"))
-        # verify the mapping against what is really in the level
-        worst, bad, missing_comp = 0.0, 0, 0
+        # verify the mapping against what is really in the level. Instances someone changed in UE (视效 10-09: preview-only
+        # hiding of the buildings 建模's north slope replaces, moved 10 km down) are not an error: they are listed as
+        # changed_in_ue and left alone - bl_sync only ever touches what an override names. A level that does not match
+        # the table at all (most instances off, an index past the end, a missing HISM) still refuses to attach.
+        worst, bad, missing_comp, changed = 0.0, 0, 0, []
         for iid, (key, idx) in self.home.items():
             c = self.comps.get(key)
             if c is None:
@@ -341,12 +344,17 @@ class Batch:
                 bad += 1
                 continue
             e = xf_err(c.get_instance_transform(idx, True), self.base[iid])
-            worst = max(worst, e)
-            bad += e > 1.0
+            if e > 1.0:
+                changed.append(iid)
+            else:
+                worst = max(worst, e)
+        self.foreign = set(changed)                 # changed in UE by someone else when attached
         self.report = {"batch": self.data.get("batch"), "instances": len(self.base), "skipped_no_mesh": skipped,
                        "hism": len(self.comps), "verify_bad": bad, "verify_worst_cm": round(worst, 3),
+                       "changed_in_ue": len(changed), "changed_in_ue_ids": sorted(changed)[:20],
                        "missing_comp": missing_comp, "slot_table": self.slot_table_path, "seconds": round(time.time() - t0, 2)}
-        assert bad == 0 and missing_comp == 0, f"level does not match the placements table: {self.report}"
+        too_many = len(changed) > (0 if req.get("strict") else 0.9 * max(1, len(self.home)))
+        assert bad == 0 and missing_comp == 0 and not too_many, f"level does not match the placements table: {self.report}"
 
     def mesh_for(self, part, lods=None, fallback=False):
         # identical to ct_placements.mesh_for for the base table; fallback (overrides only) also tries the NEAR mesh
@@ -689,6 +697,10 @@ class Batch:
                 counts[r] = counts.get(r, 0) + 1
                 if r in ("moved", "added", "swapped"):
                     touched.append(iid)
+                foreign = getattr(self, "foreign", None)
+                if foreign and iid in foreign:      # the override wins over a change made in UE: say so
+                    foreign.discard(iid)
+                    out.setdefault("overrode_ue_changes", []).append(iid)
             except MeshPending:                     # #28: placed by finish_imports() once its mesh is imported
                 waiting.add(iid)
                 counts["waiting_mesh"] = counts.get("waiting_mesh", 0) + 1
@@ -1079,9 +1091,12 @@ def record_name(r):
 def restore():
     """after an editor restart: attach every batch of the session file again and watch its files (the override files
     are cumulative, so the preview comes back as it was). Batches that fail are reported and kept in the file."""
-    sess, out = _session(), {"attached": {}, "failed": {}}
+    sess, out = _session(), {"attached": {}, "failed": {}, "already": []}
     for req in sess.get("attach", []):
         key = record_name(req)
+        if key in S["batches"]:                 # restore twice (视效's start script + a manual one): keep what runs
+            out["already"].append(key)
+            continue
         try:
             out["attached"][key] = attach(req, remember=False)
         except Exception as exc:
@@ -1093,8 +1108,28 @@ def restore():
 
 
 def attach(req, remember=True):
+    """a batch attached already under the same name (record_name: the resolved one, Ash 10-10) is replaced: it goes back
+    to its table first - a second Batch over a layer the first one changed would take the preview's added instances for
+    table rows and never trim them. If the new Batch cannot be built (a broken file, a table that does not match the
+    level), the old one is put back exactly as it was and the error is raised."""
     kinds = {"veg": VegBatch, "ground": GroundBatch}
-    b = kinds.get(req.get("kind"), Batch)(req)
+    key = record_name(req)
+    old = S["batches"].get(key)
+    prev_ov = getattr(old, "last_ov", None)
+    if old is not None:
+        reset(key)
+        del S["batches"][key]
+    try:
+        b = kinds.get(req.get("kind"), Batch)(req)
+    except Exception:
+        if old is not None:                         # roll back: the old batch and its preview as they were
+            S["batches"][key] = old
+            if prev_ov is not None:
+                old.apply(prev_ov)
+            reguard()
+        raise
+    if old is not None and S.get("watch"):
+        S["watch"]["sig"] = {}                      # the watched files are applied again to the new object
     if remember:
         sess = _session()
         keep = {k: v for k, v in req.items() if k not in ("id", "script", "action")}
@@ -1241,6 +1276,24 @@ def reset(name):
     return b.apply({"rev": "reset", "instances": {}, "meshes": {}})
 
 
+def reapply(name=None):
+    """every instance the last override names is placed again, even if bl_sync thinks it already shows that state -
+    for after another tool moved instances of a batch layer in UE (视效 10-09: lk_ns_hide restore brought back two
+    buildings the override deletes). Instances the override does not name are not touched. Writes the receipt."""
+    out = {}
+    for n, b in S["batches"].items():
+        if (name and n != name) or b.last_ov is None:
+            continue
+        keep = b.applied
+        b.applied = {}                              # nothing counts as shown: apply() places every listed instance
+        try:
+            out[n] = _receipt(b, b.apply(b.last_ov))
+        except Exception:
+            b.applied = keep
+            raise
+    return out
+
+
 def detach(name=None, forget=True):
     """stop watching, reset every attached batch (or one), give all guarded files their mode back, forget the batch
     (also in the session file: a later restore will not bring it back). forget=False (code reload): the session file
@@ -1352,7 +1405,7 @@ def where(name, iid):
 
 # ---------------------------------------------------------------- control channel (own file, not 视效's lk_session)
 ACTIONS = ("attach", "apply", "watch", "unwatch", "reset", "detach", "status", "restore", "suspend", "resume", "remap",
-           "where", "materials", "fingerprint")
+           "where", "materials", "fingerprint", "reapply")
 
 
 def dispatch(req):
@@ -1395,6 +1448,8 @@ def _dispatch(req):
         return materials(req["name"], req["inst"])
     if act == "fingerprint":
         return fingerprint()
+    if act == "reapply":
+        return reapply(req.get("name"))
     return {"batches": {k: {"rev": b.rev, "overrides": len(b.applied), "instances": len(b.base),
                             "pending_meshes": sorted(b.pending)} for k, b in S["batches"].items()},
             "imports": {r.get("part", f): r.get("state") for f, r in _ASYNC.items() if r.get("state") != "done"},
